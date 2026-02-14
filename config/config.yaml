@@ -118,6 +118,9 @@ live:
 
   # 주문 오류가 연속으로 터질 때 '진입만 중단'이 아니라 safe_mode로 승격(보수 운용)
   safe_mode_on_order_errors: true
+  # safe_mode 자동 복구(오류가 사라졌고 일정 시간 안정화되면 자동 해제)
+  safe_mode_auto_recover: true
+  safe_mode_recover_seconds: 900
 
   # 주문 멱등성(중복 제출 방지) 버킷(초)
   order_dedup_entry_seconds: 10

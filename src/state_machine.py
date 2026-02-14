@@ -36,6 +36,29 @@ def run_backtest_30d(cfg: dict) -> dict:
 from .upbit_ws import UpbitWebSocket
 
 class TradingStateMachine:
+    @staticmethod
+    def _should_auto_recover_safe_mode(
+        *,
+        safe_mode: bool,
+        error_count: int,
+        now_ms: int,
+        stable_since_ms: int,
+        entry_pause_until_ms: int,
+        recover_seconds: int,
+        auto_recover: bool,
+    ) -> bool:
+        if not safe_mode:
+            return False
+        if not auto_recover:
+            return False
+        if stable_since_ms <= 0:
+            return False
+        if error_count != 0:
+            return False
+        if now_ms < entry_pause_until_ms:
+            return False
+        return (now_ms - stable_since_ms) >= int(recover_seconds) * 1000
+
     def __init__(self, cfg: dict, rest_client, cache, storage, risk_manager, reporter, mode: str):
         self.cfg = cfg
         self.rest = rest_client
@@ -61,6 +84,8 @@ class TradingStateMachine:
         self.last_universe_refresh_ms = 0
         self.replacement_events = deque(maxlen=30)
         self.safe_mode = False
+        self._safe_mode_since_ms: int = 0
+        self._last_order_error_ms: int = 0
 
         # --- 동시성/중복주문 방지 ---
         # WS 손절 등에서 동일 마켓이 동시에 여러 번 청산되는 것을 방지
@@ -323,11 +348,32 @@ class TradingStateMachine:
         # live 모드에서만 safe_mode 발동 (paper 모드는 공용 API 429로 인한 진입 차단 방지)
         if self.mode == "live" and self.rest.error_count >= self.cfg["runtime"]["safe_mode_error_threshold"]:
             if not self.safe_mode:
+                self._safe_mode_since_ms = now_ms()
                 try:
                     self.storage.log_event("ERROR", "SAFE_MODE_ON", None, f"error_count={self.rest.error_count}")
                 except Exception:
                     pass
             self.safe_mode = True
+
+        # safe_mode 자동 복구(조건 충족 시)
+        if self.mode == "live" and self.safe_mode:
+            live_cfg = (self.cfg.get("live", {}) or {})
+            recover_s = int(live_cfg.get("safe_mode_recover_seconds", 900) or 900)
+            stable_since = max(self._safe_mode_since_ms or 0, self._last_order_error_ms or 0)
+            if self._should_auto_recover_safe_mode(
+                safe_mode=self.safe_mode,
+                error_count=int(getattr(self.rest, "error_count", 0) or 0),
+                now_ms=now,
+                stable_since_ms=int(stable_since or 0),
+                entry_pause_until_ms=int(self._entry_pause_until_ms or 0),
+                recover_seconds=recover_s,
+                auto_recover=bool(live_cfg.get("safe_mode_auto_recover", True)),
+            ):
+                self.safe_mode = False
+                try:
+                    self.storage.log_event("INFO", "SAFE_MODE_OFF", None, f"stable_s>={recover_s}")
+                except Exception:
+                    pass
 
         # entry pause 상태 변화를 이벤트로 남김
         now = now_ms()
@@ -672,6 +718,7 @@ class TradingStateMachine:
         t = now_ms()
         self._order_error_events_ms.append(t)
 
+        self._last_order_error_ms = t
         try:
             self.storage.log_event("WARN", "ORDER_ERROR", None, err_reason or "unknown")
         except Exception:
@@ -704,6 +751,7 @@ class TradingStateMachine:
             if bool((self.cfg.get("live", {}) or {}).get("safe_mode_on_order_errors", True)):
                 if not self.safe_mode:
                     self.safe_mode = True
+                    self._safe_mode_since_ms = t
                     try:
                         self.storage.log_event(
                             "ERROR",
@@ -861,12 +909,26 @@ class TradingStateMachine:
                 continue
             self._entry_inflight.add(market)
             try:
+                try:
+                    self.storage.log_event(
+                        "INFO",
+                        "BUY_ATTEMPT",
+                        market,
+                        f"pos_value_krw={pos_value:.0f} qty={qty:.8f} px={px:.4f} score={s.score:.0f} cutoff={s.dynamic_cutoff}",
+                    )
+                except Exception:
+                    pass
+
                 res = await self.exec_engine.execute_market(market, "BUY", pos_value, qty, px, gate["slip_est"], "entry_or_add")
             finally:
                 self._entry_inflight.discard(market)
 
             if not res.ok:
                 self.risk.stats.order_errors += 1
+                try:
+                    self.storage.log_event("WARN", "BUY_FAIL", market, f"reason={res.reason}")
+                except Exception:
+                    pass
                 # 주문 오류가 연속되면 신규 진입을 잠시 멈춤(서킷 브레이커)
                 self._record_order_error_and_maybe_pause(res.reason)
                 continue
@@ -875,12 +937,20 @@ class TradingStateMachine:
             filled_qty = float(res.qty)
             if filled_qty <= 1e-12:
                 self.risk.stats.order_errors += 1
+                try:
+                    self.storage.log_event("WARN", "BUY_FAIL", market, "filled_qty_zero")
+                except Exception:
+                    pass
                 self._record_order_error_and_maybe_pause("filled_qty_zero")
                 continue
 
             if market not in self.portfolio.positions:
                 stop_price = res.fill_price * (1 - stop_pct)
                 self.portfolio.add(market, filled_qty, res.fill_price, stop_price, s.score)
+                try:
+                    self.storage.log_event("INFO", "BUY_OK", market, f"fill_px={res.fill_price:.4f} qty={filled_qty:.8f}")
+                except Exception:
+                    pass
             else:
                 # 추가 매수: 평단가 갱신 및 스탑로스 상향 (Trailing Up)
                 old_p = self.portfolio.positions[market]
@@ -898,6 +968,10 @@ class TradingStateMachine:
                 old_p.stop_price = new_stop
                 old_p.adds += 1 # 불타기 횟수 증가
                 LOGGER.info(f"Position Added: {market} NewQty={new_qty:.4f} NewAvg={new_avg:.2f} NewStop={new_stop:.2f}")
+                try:
+                    self.storage.log_event("INFO", "BUY_OK", market, f"add fill_px={res.fill_price:.4f} qty={filled_qty:.8f} new_avg={new_avg:.4f}")
+                except Exception:
+                    pass
 
             self.risk.stats.total_trades += 1
             n = self.risk.stats.total_trades

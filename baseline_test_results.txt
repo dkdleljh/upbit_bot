@@ -1,0 +1,136 @@
+.F...FF....F.......F.....F....                                           [100%]
+=================================== FAILURES ===================================
+__________ TestSignalEngine.test_score_execution_just_above_threshold __________
+
+self = <test_framework.TestSignalEngine object at 0x71db53b08800>
+
+    def test_score_execution_just_above_threshold(self):
+        """Test scoring just above thresholds."""
+        score, tradable = score_execution(0.0010, 5.1)
+    
+>       assert score == 22  # 14 + 8
+        ^^^^^^^^^^^^^^^^^^
+E       assert 28 == 22
+
+tests/test_framework.py:172: AssertionError
+_________________ TestSignalEngine.test_build_signal_tradable __________________
+
+self = <test_framework.TestSignalEngine object at 0x71db53b09130>
+
+    def test_build_signal_tradable(self):
+        """Test signal building with tradable conditions."""
+        candles = TestFixtures.create_test_candles(30)
+    
+        signal = build_signal(
+            market="KRW-BTC",
+            candles=candles,
+            notional_ratio=4.0,
+            spread_pct=0.0008,
+            depth_ratio=8.0,
+            btc_regime_ok=True,
+            notional_ratio_min=3.0
+        )
+    
+        assert signal.market == "KRW-BTC"
+>       assert signal.tradable is True
+E       AssertionError: assert False is True
+E        +  where False = Signal(market='KRW-BTC', score=70, breakout=False, breakout_pct=0.0, notional_ratio=4.0, spread_pct=0.0008, depth_ratio=8.0, momentum_3m=0.0065528196981731535, btc_regime_ok=True, tradable=False, note='FAIL').tradable
+
+tests/test_framework.py:211: AssertionError
+_______________ TestSignalEngine.test_build_signal_not_tradable ________________
+
+self = <test_framework.TestSignalEngine object at 0x71db53b093a0>
+
+    def test_build_signal_not_tradable(self):
+        """Test signal building with non-tradable conditions."""
+        candles = TestFixtures.create_test_candles(10)  # Not enough candles
+    
+        signal = build_signal(
+            market="KRW-BTC",
+            candles=candles,
+            notional_ratio=2.0,
+            spread_pct=0.0020,  # Too high spread
+            depth_ratio=2.0,      # Too low depth
+            btc_regime_ok=False,
+            notional_ratio_min=3.0
+        )
+    
+        assert signal.tradable is False
+>       assert signal.note == "FAIL"
+E       AssertionError: assert 'candles 부족' == 'FAIL'
+E         
+E         - FAIL
+E         + candles 부족
+
+tests/test_framework.py:231: AssertionError
+______________________ TestIndicators.test_ema_edge_cases ______________________
+
+self = <test_framework.TestIndicators object at 0x71db53b08ad0>
+
+    def test_ema_edge_cases(self):
+        """Test EMA edge cases."""
+        # Empty list
+>       assert ema([], 5) is None
+E       assert 0.0 is None
+E        +  where 0.0 = ema([], 5)
+
+tests/test_framework.py:283: AssertionError
+___________________ TestRiskManager.test_update_realized_pnl ___________________
+
+self = <test_framework.TestRiskManager object at 0x71db53b0a8d0>
+
+    def test_update_realized_pnl(self):
+        """Test realized P&L updates."""
+        cfg = TestFixtures.create_test_config()
+        risk_manager = RiskManager(cfg, 10000000)
+    
+        # Add profit
+        risk_manager.update_realized(100000)
+        assert risk_manager.realized_pnl == 100000
+        assert risk_manager.equity == 10100000
+>       assert risk_manager.daily_realized_pct == 0.1
+E       assert 0.01 == 0.1
+E        +  where 0.01 = <src.risk.RiskManager object at 0x71db53b0b6e0>.daily_realized_pct
+
+tests/test_framework.py:423: AssertionError
+_________________ TestIntegration.test_end_to_end_signal_flow __________________
+
+self = <test_framework.TestIntegration object at 0x71db53b0ad80>
+
+    def test_end_to_end_signal_flow(self):
+        """Test end-to-end signal generation flow."""
+        storage, temp_path = TestFixtures.create_temp_storage()
+    
+        try:
+            # Setup test data
+            candles = TestFixtures.create_test_candles(30)
+    
+            # Insert test candles
+            for candle in candles:
+>               storage.execute(
+                    "INSERT INTO candles (market, timestamp, open, high, low, close, volume, value) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    ("KRW-BTC", candle['timestamp'], candle['open'], candle['high'],
+                     candle['low'], candle['close'], candle['volume'], candle['value'])
+                )
+
+tests/test_framework.py:541: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = <src.storage.Storage object at 0x71db53b90650>
+sql = 'INSERT INTO candles (market, timestamp, open, high, low, close, volume, value) VALUES (?, ?, ?, ?, ?, ?, ?, ?)'
+params = ('KRW-BTC', 1770557279.692589, 49750, 50200, 48800, 49500, ...)
+
+    def execute(self, sql: str, params: tuple = ()) -> None:
+        with self.lock, self.conn:
+>           self.conn.execute(sql, params)
+E           sqlite3.OperationalError: no such table: candles
+
+src/storage.py:149: OperationalError
+=========================== short test summary info ============================
+FAILED tests/test_framework.py::TestSignalEngine::test_score_execution_just_above_threshold
+FAILED tests/test_framework.py::TestSignalEngine::test_build_signal_tradable
+FAILED tests/test_framework.py::TestSignalEngine::test_build_signal_not_tradable
+FAILED tests/test_framework.py::TestIndicators::test_ema_edge_cases - assert ...
+FAILED tests/test_framework.py::TestRiskManager::test_update_realized_pnl - a...
+FAILED tests/test_framework.py::TestIntegration::test_end_to_end_signal_flow
+6 failed, 24 passed in 0.50s

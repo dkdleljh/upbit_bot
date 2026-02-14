@@ -1,0 +1,117 @@
+base_ccy: KRW
+mode: paper
+timezone: Asia/Seoul
+
+env:
+  upbit_access_key: UPBIT_ACCESS_KEY
+  upbit_secret_key: UPBIT_SECRET_KEY
+
+universe:
+  top30: 30  # KRW/BTC/USDT 마켓까지 포함되도록 후보를 넓힘
+  tradable_top10: 10
+  refresh_seconds: 600  # 5분 -> 10분으로 늦춤 (API 레이트 관리)
+
+gates:
+  # (승률형) 스프레드 엄격화: 체결/리버설 비용을 줄여 '비싸게 사고 싸게 파는' 체감을 완화
+  spread_max: 0.0020
+  # BTC/USDT 마켓은 스프레드가 구조적으로 넓어(유동성 낮음) 별도 컷을 둡니다.
+  spread_max_btc: 0.02
+  spread_max_usdt: 0.02
+  depth_ratio_min: 5.0
+  entry_slippage_cap: 0.0025
+  exit_slippage_cap: 0.0030
+  cooldown_minutes: 30
+
+signal:
+  timeframe_main: 1m
+  timeframe_filter: 5m
+  breakout_lookback_minutes: 20
+  # (승률형) 거래대금 비율 컷을 높여 잡음 진입을 줄입니다.
+  notional_ratio_min: 0.9
+
+risk:
+  max_positions: 10
+  total_exposure_cap: 0.70
+  per_coin_exposure_cap: 0.12
+  risk_per_trade_start: 0.001
+  risk_per_trade_target: 0.002
+  promote_requirements:
+    min_trades: 200
+    max_order_error_rate: 0.005
+    max_avg_entry_slippage: 0.0025
+  daily_stop_loss_pct: -0.02
+
+stops:
+  atr_period: 14
+  atr_timeframe: 1m
+  atr_multiplier: 1.6
+  stop_pct_min: 0.009
+  stop_pct_max: 0.025
+  # 스나이퍼 모드: 1.0% 수익 시 절반 익절 (승률 확보)
+  tp_net_pnl_pct: 0.013 
+  tp1_ratio: 0.5
+  trailing_stop_pct: 0.012 
+
+time_rules:
+  min_hold_seconds: 60 # 90 -> 60 (더 빠르게)
+  soft_cut_minutes: 20 # 8 -> 5 (안 가면 빨리 자르기)
+  soft_cut_progress: 0.01
+  hard_exit_minutes: 60
+
+replace:
+  score_gap_min: 12
+  coin_cooldown_minutes: 5
+  rate_limit_per_minute: 1
+  exceptions:
+    trend_ok_drawdown_from_peak: 0.008
+    replace_if_pnl_below: -0.008
+
+min_notional_krw: 10000
+
+dust:
+  # 평상시에는 더스트가 생기지 않게(진입 금액 상향, 매도 수량 동기화, 최소금액 미만은 무시)
+  # 자동 top-up 매수는 끕니다. (원하실 때 scripts/cleanup_dust.py로 일괄 정리)
+  topup_before_sell: true
+  # 매도 주문금액이 5,000원 미만일 때, 부족분을 소액 추가매수해서(시장가) 5,000원 이상 만든 뒤 매도
+  topup_buffer_krw: 2000
+  topup_max_krw: 20000
+  # 더스트 처리 중 동일 코인 반복 매수/매도 루프 방지
+  topup_cooldown_seconds: 1800
+
+daily_report:
+  hour: 0
+  minute: 5
+
+fees:
+  KRW: 0.0005
+  BTC: 0.0010
+  USDT: 0.0010
+
+runtime:
+  loop_interval_seconds: 10
+  paper_initial_equity_krw: 10000000
+  backtest_days: 3
+  backtest_default_slippage: 0.002
+  safe_mode_error_threshold: 5
+  # 실계좌 기반 평가금액(미실현손익 포함) 스냅샷 저장 주기
+  equity_snapshot_seconds: 300
+
+live:
+  # 재시작 시 '기존 보유(수동매매 포함)'를 포트폴리오로 자동 복원해서 손절/익절까지 관리할지 여부
+  # - false 권장(안전): 봇이 산 것만 관리
+  # - true: 계좌 보유분도 봇이 관리(WS 손절이 바로 터질 수 있으니 주의)
+  manage_existing_positions: false
+  # 기존보유 복원 포지션은 즉시 WS 손절을 걸면 과매도/휩쏘 위험이 있어 유예시간을 둡니다(초)
+  restored_stoploss_grace_seconds: 300
+
+  # Circuit Breaker: 손절이 연속으로 터질 때 자동으로 신규 진입을 잠시 중단
+  circuit_breaker:
+    window_seconds: 300          # 최근 N초
+    max_stoploss_events: 2       # 손절 이벤트가 이 횟수 이상이면
+    pause_minutes: 30            # 신규 진입을 M분 중단
+
+  # Circuit Breaker (Order Errors): 주문 실패/레이트리밋/잔고부족 등이 연속으로 발생하면 신규 진입 중단
+  circuit_breaker_order_errors:
+    window_seconds: 180
+    max_error_events: 3
+    pause_minutes: 20

@@ -1,0 +1,15 @@
+{
+  "report_generated_at": "2026-02-09T01:22:33.553151",
+  "monitoring_duration_minutes": 2.001139978567759,
+  "latest_metrics": {
+    "timestamp": "2026-02-09T01:22:33.553027",
+    "elapsed_minutes": 2.0011377771695456,
+    "api_calls": 0,
+    "api_errors": 0,
+    "api_success_rate": 0.0,
+    "successful_trades": 0,
+    "trade_success_rate": 0.0,
+    "avg_response_time_ms": 0.0,
+    "trades_per_minute": 0.0
+  }
+}

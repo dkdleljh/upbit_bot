@@ -1,0 +1,6 @@
+aiohttp
+pyyaml
+numpy
+pandas
+pytest
+websockets

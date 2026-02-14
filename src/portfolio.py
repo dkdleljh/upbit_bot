@@ -31,19 +31,37 @@ class Portfolio:
     def total_exposure_ratio(self, equity: float, last_prices: dict[str, float]) -> float:
         if equity <= 0:
             return 0.0
-        value = 0.0
+        value_krw = 0.0
         for p in self.positions.values():
-            value += p.qty * last_prices.get(p.market, p.entry_price)
-        return value / equity
+            px = last_prices.get(p.market, p.entry_price)
+            quote = parse_market(p.market).quote
+            quote_krw = 1.0
+            if quote == "BTC":
+                quote_krw = float(last_prices.get("KRW-BTC", 0.0) or 0.0)
+            elif quote == "USDT":
+                quote_krw = float(last_prices.get("KRW-USDT", 0.0) or 0.0)
+            if quote_krw <= 0:
+                quote_krw = 1.0
+            value_krw += p.qty * px * quote_krw
+        return value_krw / equity
 
     def coin_exposure_ratio(self, base_coin: str, equity: float, last_prices: dict[str, float]) -> float:
         if equity <= 0:
             return 0.0
-        value = 0.0
+        value_krw = 0.0
         for p in self.positions.values():
             if p.base_coin == base_coin:
-                value += p.qty * last_prices.get(p.market, p.entry_price)
-        return value / equity
+                px = last_prices.get(p.market, p.entry_price)
+                quote = parse_market(p.market).quote
+                quote_krw = 1.0
+                if quote == "BTC":
+                    quote_krw = float(last_prices.get("KRW-BTC", 0.0) or 0.0)
+                elif quote == "USDT":
+                    quote_krw = float(last_prices.get("KRW-USDT", 0.0) or 0.0)
+                if quote_krw <= 0:
+                    quote_krw = 1.0
+                value_krw += p.qty * px * quote_krw
+        return value_krw / equity
 
     def add(
         self,

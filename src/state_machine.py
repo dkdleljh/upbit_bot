@@ -685,7 +685,20 @@ class TradingStateMachine:
             if pos_value < self.cfg["min_notional_krw"]:
                 continue
 
-            gate_ok, gate = self.exec_engine.check_quality_gate(market, orderbooks[market], pos_value, "BUY")
+            # check_quality_gate의 depth_ratio는 '주문금액'과 orderbook의 단위가 같아야 의미가 있습니다.
+            # orderbook 금액은 quote 단위이므로, KRW pos_value를 quote로 환산해서 전달합니다.
+            gate_order_value = pos_value
+            quote = parse_market(market).quote
+            if quote == "BTC":
+                qkrw = float(last_prices.get("KRW-BTC", 0.0) or 0.0)
+                if qkrw > 0:
+                    gate_order_value = pos_value / qkrw
+            elif quote == "USDT":
+                qkrw = float(last_prices.get("KRW-USDT", 0.0) or 0.0)
+                if qkrw > 0:
+                    gate_order_value = pos_value / qkrw
+
+            gate_ok, gate = self.exec_engine.check_quality_gate(market, orderbooks[market], gate_order_value, "BUY")
             if not gate_ok:
                 continue
 
@@ -701,6 +714,8 @@ class TradingStateMachine:
 
             spend_quote = pos_value / quote_krw
             qty = spend_quote / max(px, 1e-12)
+            if qty <= 1e-12:
+                continue
             self._entry_inflight.add(market)
             try:
                 res = await self.exec_engine.execute_market(market, "BUY", pos_value, qty, px, gate["slip_est"], "entry_or_add")
@@ -714,14 +729,20 @@ class TradingStateMachine:
                 continue
 
             # 포트폴리오 업데이트 (신규 or 추가)
+            filled_qty = float(res.qty)
+            if filled_qty <= 1e-12:
+                self.risk.stats.order_errors += 1
+                self._record_order_error_and_maybe_pause("filled_qty_zero")
+                continue
+
             if market not in self.portfolio.positions:
                 stop_price = res.fill_price * (1 - stop_pct)
-                self.portfolio.add(market, qty, res.fill_price, stop_price, s.score)
+                self.portfolio.add(market, filled_qty, res.fill_price, stop_price, s.score)
             else:
                 # 추가 매수: 평단가 갱신 및 스탑로스 상향 (Trailing Up)
                 old_p = self.portfolio.positions[market]
-                new_qty = old_p.qty + qty
-                new_avg = ((old_p.qty * old_p.entry_price) + (qty * res.fill_price)) / new_qty
+                new_qty = old_p.qty + filled_qty
+                new_avg = ((old_p.qty * old_p.entry_price) + (filled_qty * res.fill_price)) / new_qty
                 
                 # 스탑로스는 '새 평단가' 기준이 아니라, '현재가' 기준으로 타이트하게 올림 (수익 보전)
                 new_stop = px * (1 - stop_pct) 
@@ -787,7 +808,18 @@ class TradingStateMachine:
                         self.portfolio.positions[market] = removed
                     continue
 
-                pnl_value = (res.fill_price - removed.entry_price) * qty - res.fee
+                # 손익은 KRW 기준으로 기록해야 RiskManager/EQ가 정상 동작합니다.
+                quote = parse_market(market).quote
+                quote_krw = 1.0
+                if quote == "BTC":
+                    quote_krw = float(last_prices.get("KRW-BTC", 0.0) or 0.0)
+                elif quote == "USDT":
+                    quote_krw = float(last_prices.get("KRW-USDT", 0.0) or 0.0)
+                if quote_krw <= 0:
+                    quote_krw = 1.0
+
+                pnl_quote = (res.fill_price - removed.entry_price) * qty - res.fee
+                pnl_value = pnl_quote * quote_krw
                 self.risk.update_realized(pnl_value)
 
                 if a["ratio"] < 0.999:
@@ -982,11 +1014,14 @@ class TradingStateMachine:
 
     async def _seed_mock_candles(self, market):
         base = random.uniform(1000, 100000)
+        # now_ms를 루프에서 계속 쓰면 같은 ms로 덮어쓰기 될 수 있어, 1분 단위로 증가시키며 생성
+        ts = now_ms() - 100 * 60_000
         for _ in range(100):
+            ts += 60_000
             d = random.uniform(-0.002, 0.002)
             close = max(1, base * (1 + d))
             c = {
-                "ts_ms": now_ms(),
+                "ts_ms": ts,
                 "open": base,
                 "high": max(base, close) * (1 + random.uniform(0, 0.0015)),
                 "low": min(base, close) * (1 - random.uniform(0, 0.0015)),

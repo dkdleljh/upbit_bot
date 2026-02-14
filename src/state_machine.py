@@ -67,13 +67,6 @@ class TradingStateMachine:
         # --- 시장별 직렬화 락(진입/청산/포지션 업데이트 레이스 방지) ---
         self._market_locks: dict[str, asyncio.Lock] = {}
 
-    def _lock_for(self, market: str) -> asyncio.Lock:
-        lock = self._market_locks.get(market)
-        if lock is None:
-            lock = asyncio.Lock()
-            self._market_locks[market] = lock
-        return lock
-
         # 1분봉은 분당 1개만 갱신되므로, market별 캔들 REST 호출은 최소 60초 간격으로 제한
         self._last_candle_fetch_ms: dict[str, int] = {}
 
@@ -84,6 +77,13 @@ class TradingStateMachine:
         # tickers/orderbook REST 호출 과다 방지
         self._last_ticker_refresh_ms: int = 0
         self._last_orderbook_refresh_ms: int = 0
+
+    def _lock_for(self, market: str) -> asyncio.Lock:
+        lock = self._market_locks.get(market)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._market_locks[market] = lock
+        return lock
 
     async def initialize(self):
         # 0) 마켓 목록 확보

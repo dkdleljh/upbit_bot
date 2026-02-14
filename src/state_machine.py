@@ -47,6 +47,10 @@ class TradingStateMachine:
         self.exec_engine = ExecutionEngine(cfg, storage, mode, rest_client=rest_client)
         self.portfolio = Portfolio(cfg)
         self.ws = None # WS 초기화는 initialize에서
+
+        # WS 이벤트 폭주 방지: 콜백에서 태스크를 만들지 않고 큐로 넘겨 단일 소비자가 처리
+        self._ws_in_q: asyncio.Queue = asyncio.Queue(maxsize=5000)
+        self._ws_consumer_task: asyncio.Task | None = None
         self.universe_top10: list[str] = []
         self.all_markets: list[str] = []
         self.last_universe_refresh_ms = 0
@@ -131,6 +135,10 @@ class TradingStateMachine:
         self.ws.add_callback(self._on_ws_data)
         await self.ws.start()
 
+        # WS 소비자 시작(중복 시작 방지)
+        if self._ws_consumer_task is None or self._ws_consumer_task.done():
+            self._ws_consumer_task = asyncio.create_task(self._ws_consumer_loop())
+
     async def run(self):
         await self.initialize()
         await self.reporter.start()
@@ -149,14 +157,35 @@ class TradingStateMachine:
                      self.ws.markets = list(self.universe_top10)
                      await self.ws.start()
 
+                     # 소비자는 유지되지만, 혹시 죽어있으면 재기동
+                     if self._ws_consumer_task is None or self._ws_consumer_task.done():
+                         self._ws_consumer_task = asyncio.create_task(self._ws_consumer_loop())
+
             except Exception as e:
                 LOGGER.exception("Main Loop Error: %s", e)
             
             await asyncio.sleep(10) # 10초 주기
 
     def _on_ws_data(self, data: dict):
-        # WS 데이터 수신 시 호출되는 콜백 (비동기 처리 필요하므로 Task 생성)
-        asyncio.create_task(self._process_ws_data_async(data))
+        # WS 콜백에서 create_task를 무한히 만들면 폭주/지연이 생길 수 있어 큐로 넘깁니다.
+        try:
+            if not self._ws_in_q.full():
+                self._ws_in_q.put_nowait(data)
+        except Exception:
+            # 큐 오류는 WS를 죽일 정도는 아니므로 무시
+            return
+
+    async def _ws_consumer_loop(self):
+        # 단일 소비자 루프: WS 메시지를 순서대로 처리
+        while True:
+            try:
+                data = await self._ws_in_q.get()
+                await self._process_ws_data_async(data)
+            except asyncio.CancelledError:
+                return
+            except Exception as e:
+                LOGGER.exception("WS consumer error: %s", e)
+                await asyncio.sleep(0.2)
 
     async def _process_ws_data_async(self, data: dict):
         ty = data.get("type")

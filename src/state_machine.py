@@ -51,6 +51,11 @@ class TradingStateMachine:
         # WS 이벤트 폭주 방지: 콜백에서 태스크를 만들지 않고 큐로 넘겨 단일 소비자가 처리
         self._ws_in_q: asyncio.Queue = asyncio.Queue(maxsize=5000)
         self._ws_consumer_task: asyncio.Task | None = None
+        self._ws_drop_count: int = 0
+        self._last_ws_drop_event_ms: int = 0
+
+        # 운영 heartbeat(전략 루프 생존/지연 관측)
+        self._last_heartbeat_event_ms: int = 0
         self.universe_top10: list[str] = []
         self.all_markets: list[str] = []
         self.last_universe_refresh_ms = 0
@@ -184,6 +189,23 @@ class TradingStateMachine:
         try:
             if not self._ws_in_q.full():
                 self._ws_in_q.put_nowait(data)
+                return
+
+            # 큐가 꽉 찼으면 드랍(백프레셔) + 이벤트로 관측
+            self._ws_drop_count += 1
+            now = now_ms()
+            # 10초에 한 번만 이벤트로 남김(스팸 방지)
+            if now - self._last_ws_drop_event_ms >= 10_000:
+                self._last_ws_drop_event_ms = now
+                try:
+                    self.storage.log_event(
+                        "WARN",
+                        "WS_QUEUE_DROP",
+                        None,
+                        f"drops={self._ws_drop_count} qsize={self._ws_in_q.qsize()} max={self._ws_in_q.maxsize}",
+                    )
+                except Exception:
+                    pass
         except Exception:
             # 큐 오류는 WS를 죽일 정도는 아니므로 무시
             return
@@ -324,6 +346,21 @@ class TradingStateMachine:
                     self.storage.log_event("INFO", "ENTRY_RESUMED", None, "pause_expired")
                 except Exception:
                     pass
+
+        # 전략 루프 heartbeat (1분에 1회) — '신호가 없다/멈췄다'를 즉시 구분 가능
+        if now - self._last_heartbeat_event_ms >= 60_000:
+            self._last_heartbeat_event_ms = now
+            try:
+                paused_left = max(0, int((self._entry_pause_until_ms - now) / 1000))
+                self.storage.log_event(
+                    "INFO",
+                    "STRATEGY_HEARTBEAT",
+                    None,
+                    f"mode={self.mode} safe_mode={self.safe_mode} err_count={getattr(self.rest,'error_count',None)} "
+                    f"positions={len(self.portfolio.positions)} paused_left_s={paused_left} ws_q={self._ws_in_q.qsize()} drops={self._ws_drop_count}",
+                )
+            except Exception:
+                pass
 
         # 실계좌 기준 포지션 동기화(수동 거래/부분 체결/재시작으로 인한 qty 불일치 방지)
         if self.mode == "live" and getattr(self.rest, "is_live_ready", False):

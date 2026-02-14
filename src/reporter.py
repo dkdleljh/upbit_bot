@@ -113,6 +113,18 @@ class Reporter:
                         f.write(f"  - {k}: {n}\n")
                     f.write("\n")
 
+                    # 주문 오류 Top3(원인)
+                    order_err = {}
+                    for ev in events:
+                        if str(ev["event"]) == "ORDER_ERROR":
+                            det = (ev["details"] or "").strip() or "unknown"
+                            order_err[det] = order_err.get(det, 0) + 1
+                    if order_err:
+                        f.write("- ORDER_ERROR Top3:\n")
+                        for det, n in sorted(order_err.items(), key=lambda x: (-x[1], x[0]))[:3]:
+                            f.write(f"  - {det}: {n}\n")
+                        f.write("\n")
+
                     # 최근 이벤트(최대 30개)
                     f.write("### Recent (last 30)\n")
                     f.write("| time | level | event | market | details |\n")

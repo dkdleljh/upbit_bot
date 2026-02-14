@@ -243,6 +243,10 @@ class TradingStateMachine:
 
                 # Circuit breaker 기록/판정 (손절 연속 시 신규진입 일시중단)
                 self._record_stoploss_and_maybe_pause()
+                try:
+                    self.storage.log_event("WARN", "STOPLOSS_WS", market, f"px={current_price}")
+                except Exception:
+                    pass
                 return
 
             # 2. Trailing Stop & Take Profit 체크
@@ -575,6 +579,15 @@ class TradingStateMachine:
                 window_s,
                 pause_m,
             )
+            try:
+                self.storage.log_event(
+                    "WARN",
+                    "CIRCUIT_BREAKER_STOPLOSS",
+                    None,
+                    f"count={len(self._stoploss_events_ms)} window_s={window_s} pause_m={pause_m}",
+                )
+            except Exception:
+                pass
 
     def _record_order_error_and_maybe_pause(self, err_reason: str = "") -> None:
         """주문 오류 이벤트를 기록하고 연속 발생 시 신규 진입을 일시 중단합니다."""
@@ -599,6 +612,15 @@ class TradingStateMachine:
                 (err_reason or "unknown"),
                 pause_m,
             )
+            try:
+                self.storage.log_event(
+                    "WARN",
+                    "CIRCUIT_BREAKER_ORDER_ERRORS",
+                    None,
+                    f"count={len(self._order_error_events_ms)} window_s={window_s} pause_m={pause_m} last={err_reason}",
+                )
+            except Exception:
+                pass
 
     async def _btc_regime_ok(self) -> bool:
         candles = await self.cache.get_candles("KRW-BTC")

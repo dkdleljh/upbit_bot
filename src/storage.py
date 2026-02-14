@@ -139,6 +139,37 @@ class Storage:
             CREATE INDEX IF NOT EXISTS ix_equity_snapshots_ts
             ON equity_snapshots(ts_ms)
             """,
+            """
+            CREATE TABLE IF NOT EXISTS runtime_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts_ms INTEGER NOT NULL,
+                level TEXT NOT NULL,
+                event TEXT NOT NULL,
+                market TEXT,
+                details TEXT
+            )
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_runtime_events_ts
+            ON runtime_events(ts_ms)
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS order_dedup (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts_ms INTEGER NOT NULL,
+                dedup_key TEXT NOT NULL,
+                market TEXT NOT NULL,
+                side TEXT NOT NULL,
+                reason TEXT,
+                qty REAL,
+                ref_price REAL,
+                note TEXT
+            )
+            """,
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS ux_order_dedup_key
+            ON order_dedup(dedup_key)
+            """,
         ]
         with self.lock, self.conn:
             for q in ddl:
@@ -221,6 +252,22 @@ class Storage:
         with self.lock, self.conn:
             self.conn.executemany(sql, params_list)
     
+    def log_event(self, level: str, event: str, market: str | None = None, details: str | None = None) -> None:
+        try:
+            self.insert(
+                "runtime_events",
+                {
+                    "ts_ms": __import__("time").time_ns() // 1_000_000,
+                    "level": level,
+                    "event": event,
+                    "market": market,
+                    "details": details,
+                },
+            )
+        except Exception:
+            # 이벤트 로깅 실패로 봇이 죽으면 안 됨
+            return
+
     def close(self) -> None:
         with self.lock:
             self.conn.close()

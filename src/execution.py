@@ -208,6 +208,32 @@ class ExecutionEngine:
                     return None
         return None
 
+    def _dedup_key(self, market: str, side: str, reason: str, ref_price: float) -> str:
+        # stop_loss 계열은 초단위로 과잉 중복을 막는 게 핵심, 엔트리는 조금 더 넉넉히 잡습니다.
+        now_s = now_ms() // 1000
+        if "stop" in (reason or "").lower():
+            bucket = now_s // int(self.cfg.get("live", {}).get("order_dedup_stop_seconds", 2) or 2)
+        elif side == "BUY":
+            bucket = now_s // int(self.cfg.get("live", {}).get("order_dedup_entry_seconds", 10) or 10)
+        else:
+            bucket = now_s // int(self.cfg.get("live", {}).get("order_dedup_exit_seconds", 5) or 5)
+
+        # ref_price까지 포함하면 너무 세밀해져 중복 방지 효과가 떨어져서, 0.1% 단위로 라운딩해서 넣습니다.
+        px_bucket = int(round(ref_price / max(ref_price * 0.001, 1e-9))) if ref_price > 0 else 0
+        return f"{market}|{side}|{reason}|{bucket}|{px_bucket}"
+
+    def _try_dedup(self, market: str, side: str, reason: str, qty: float, ref_price: float) -> bool:
+        key = self._dedup_key(market, side, reason, ref_price)
+        try:
+            self.storage.execute(
+                "INSERT INTO order_dedup(ts_ms,dedup_key,market,side,reason,qty,ref_price,note) VALUES(?,?,?,?,?,?,?,?)",
+                (now_ms(), key, market, side, reason, float(qty), float(ref_price), ""),
+            )
+            return True
+        except Exception:
+            # unique conflict 포함. (정교한 예외 분기보다 '중복이면 막기'가 목적)
+            return False
+
     async def _execute_live(
         self,
         market: str,
@@ -219,6 +245,14 @@ class ExecutionEngine:
     ) -> ExecutionResult:
         if not self.rest or not self.rest.is_live_ready:
             return ExecutionResult(False, market, side, qty, ref_price, 0.0, 0.0, "live_not_ready")
+
+        # 주문 멱등성(중복 제출 방지)
+        if not self._try_dedup(market, side, reason or "", qty, ref_price):
+            try:
+                self.storage.log_event("WARN", "ORDER_DEDUP_BLOCK", market, f"side={side} reason={reason} qty={qty} ref={ref_price}")
+            except Exception:
+                pass
+            return ExecutionResult(False, market, side, qty, ref_price, 0.0, 0.0, "dedup_block")
 
         quote = market.split("-")[0] if "-" in market else "KRW"
 

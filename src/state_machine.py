@@ -67,6 +67,7 @@ class TradingStateMachine:
         self._stoploss_events_ms = deque(maxlen=20)
         self._order_error_events_ms = deque(maxlen=50)
         self._entry_pause_until_ms: int = 0
+        self._entry_pause_logged: bool = False
 
         # --- 시장별 직렬화 락(진입/청산/포지션 업데이트 레이스 방지) ---
         self._market_locks: dict[str, asyncio.Lock] = {}
@@ -134,6 +135,10 @@ class TradingStateMachine:
         self.ws = UpbitWebSocket(markets)
         self.ws.add_callback(self._on_ws_data)
         await self.ws.start()
+        try:
+            self.storage.log_event("INFO", "WS_STARTED", None, f"markets={len(markets)}")
+        except Exception:
+            pass
 
         # WS 소비자 시작(중복 시작 방지)
         if self._ws_consumer_task is None or self._ws_consumer_task.done():
@@ -154,8 +159,16 @@ class TradingStateMachine:
                 if self.ws and set(self.ws.markets) != set(self.universe_top10):
                      LOGGER.info("유니버스 변경으로 WS 재구독...")
                      await self.ws.stop()
+                     try:
+                         self.storage.log_event("INFO", "WS_STOPPED", None, "universe_resubscribe")
+                     except Exception:
+                         pass
                      self.ws.markets = list(self.universe_top10)
                      await self.ws.start()
+                     try:
+                         self.storage.log_event("INFO", "WS_STARTED", None, f"markets={len(self.ws.markets)} universe_resubscribe")
+                     except Exception:
+                         pass
 
                      # 소비자는 유지되지만, 혹시 죽어있으면 재기동
                      if self._ws_consumer_task is None or self._ws_consumer_task.done():
@@ -287,7 +300,30 @@ class TradingStateMachine:
     async def _cycle(self):
         # live 모드에서만 safe_mode 발동 (paper 모드는 공용 API 429로 인한 진입 차단 방지)
         if self.mode == "live" and self.rest.error_count >= self.cfg["runtime"]["safe_mode_error_threshold"]:
+            if not self.safe_mode:
+                try:
+                    self.storage.log_event("ERROR", "SAFE_MODE_ON", None, f"error_count={self.rest.error_count}")
+                except Exception:
+                    pass
             self.safe_mode = True
+
+        # entry pause 상태 변화를 이벤트로 남김
+        now = now_ms()
+        if now < self._entry_pause_until_ms:
+            if not self._entry_pause_logged:
+                self._entry_pause_logged = True
+                try:
+                    left_s = int((self._entry_pause_until_ms - now) / 1000)
+                    self.storage.log_event("WARN", "ENTRY_PAUSED", None, f"left_s={left_s}")
+                except Exception:
+                    pass
+        else:
+            if self._entry_pause_logged:
+                self._entry_pause_logged = False
+                try:
+                    self.storage.log_event("INFO", "ENTRY_RESUMED", None, "pause_expired")
+                except Exception:
+                    pass
 
         # 실계좌 기준 포지션 동기화(수동 거래/부분 체결/재시작으로 인한 qty 불일치 방지)
         if self.mode == "live" and getattr(self.rest, "is_live_ready", False):
@@ -598,6 +634,11 @@ class TradingStateMachine:
 
         t = now_ms()
         self._order_error_events_ms.append(t)
+
+        try:
+            self.storage.log_event("WARN", "ORDER_ERROR", None, err_reason or "unknown")
+        except Exception:
+            pass
 
         cutoff = t - window_s * 1000
         while self._order_error_events_ms and self._order_error_events_ms[0] < cutoff:

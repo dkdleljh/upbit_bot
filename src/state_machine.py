@@ -700,6 +700,20 @@ class TradingStateMachine:
             except Exception:
                 pass
 
+            # 옵션이 켜져 있으면 안전모드로 승격(잔고/레이트리밋/권한 문제 등으로 주문이 계속 실패하는 상황)
+            if bool((self.cfg.get("live", {}) or {}).get("safe_mode_on_order_errors", True)):
+                if not self.safe_mode:
+                    self.safe_mode = True
+                    try:
+                        self.storage.log_event(
+                            "ERROR",
+                            "SAFE_MODE_ON_ORDER_ERRORS",
+                            None,
+                            f"count={len(self._order_error_events_ms)} window_s={window_s} last={err_reason}",
+                        )
+                    except Exception:
+                        pass
+
     async def _btc_regime_ok(self) -> bool:
         candles = await self.cache.get_candles("KRW-BTC")
         if len(candles) < 20: # 최소 20개는 있어야 단기 추세라도 봄

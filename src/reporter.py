@@ -36,6 +36,11 @@ class Reporter:
                 (start_of_day,),
             )
 
+            events = self.storage.query(
+                "SELECT ts_ms, level, event, market, details FROM runtime_events WHERE ts_ms >= ? ORDER BY ts_ms ASC",
+                (start_of_day,),
+            )
+
             buy_count = sum(1 for t in trades if t["side"] == "BUY")
             sell_count = sum(1 for t in trades if t["side"] == "SELL")
 
@@ -92,6 +97,34 @@ class Reporter:
                 f.write(f"- Total: {len(trades)} (BUY {buy_count} / SELL {sell_count})\n")
                 f.write(f"- Realized PnL (FIFO approx): `{realized:,.0f} KRW`\n")
                 f.write(f"- Win rate (SELL only): {win_rate:.1f}%\n\n")
+
+                f.write("## Runtime Events\n")
+                if not events:
+                    f.write("- (none)\n\n")
+                else:
+                    # 이벤트별 카운트 요약
+                    counts = {}
+                    for ev in events:
+                        k = str(ev["event"])
+                        counts[k] = counts.get(k, 0) + 1
+                    top = sorted(counts.items(), key=lambda x: (-x[1], x[0]))
+                    f.write("- Counts:\n")
+                    for k, n in top:
+                        f.write(f"  - {k}: {n}\n")
+                    f.write("\n")
+
+                    # 최근 이벤트(최대 30개)
+                    f.write("### Recent (last 30)\n")
+                    f.write("| time | level | event | market | details |\n")
+                    f.write("|---|---|---|---|---|\n")
+                    for ev in events[-30:]:
+                        dt = datetime.fromtimestamp(ev["ts_ms"] / 1000).strftime("%H:%M:%S")
+                        mk = ev["market"] or ""
+                        det = (ev["details"] or "").replace("\n", " ")
+                        if len(det) > 120:
+                            det = det[:120] + "..."
+                        f.write(f"| {dt} | {ev['level']} | {ev['event']} | {mk} | {det} |\n")
+                    f.write("\n")
 
                 f.write("## Details\n")
                 f.write("| time | market | side | req | fill | qty | fee | reason | status |\n")

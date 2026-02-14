@@ -115,3 +115,8 @@ live:
     window_seconds: 180
     max_error_events: 3
     pause_minutes: 20
+
+  # 주문 멱등성(중복 제출 방지) 버킷(초)
+  order_dedup_entry_seconds: 10
+  order_dedup_exit_seconds: 5
+  order_dedup_stop_seconds: 2

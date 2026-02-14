@@ -1,27 +1,73 @@
-import pytest
-
-pytest.skip("signal_engine scoring helpers were replaced by composite build_signal; tests need update", allow_module_level=True)
-
-from src.signal_engine import score_execution, score_momentum, score_notional
+from src.signal_engine import build_signal
 
 
-def test_score_execution_cut_and_pass():
-    s, ok = score_execution(0.0005, 8.5)
-    assert ok is True
-    assert s == 40
+def _make_candle(ts_ms: int, o: float, h: float, l: float, c: float, v: float):
+    return {
+        "ts_ms": ts_ms,
+        "timestamp": ts_ms / 1000,
+        "open": o,
+        "high": h,
+        "low": l,
+        "close": c,
+        "volume": v,
+        "value": c * v,
+    }
 
-    s2, ok2 = score_execution(0.0015, 9)
-    assert ok2 is False
-    assert s2 == 0
+
+def test_build_signal_requires_60_candles():
+    candles = [_make_candle(0 + i * 60_000, 100, 101, 99, 100, 10) for i in range(59)]
+    s = build_signal(
+        market="KRW-AAA",
+        candles=candles,
+        notional_ratio=10.0,
+        spread_pct=0.0005,
+        depth_ratio=10.0,
+        btc_regime_ok=True,
+        notional_ratio_min=0.9,
+    )
+    assert s.tradable is False
+    assert s.score == 0
+    assert "candles < 60" in (s.note or "")
 
 
-def test_score_notional_and_momentum():
-    assert score_notional(4.2) == 30
-    assert score_notional(3.2) == 22
-    assert score_notional(2.4) == 12
-    assert score_notional(1.9) == 0
+def test_build_signal_rsi_hot_veto():
+    # 강한 우상향이면 RSI가 과열로 나올 확률이 높고, 그 경우 tradable은 False가 되어야 합니다.
+    candles = []
+    px = 100.0
+    for i in range(120):
+        px *= 1.002  # 꾸준히 상승
+        candles.append(_make_candle(0 + i * 60_000, px * 0.999, px * 1.001, px * 0.998, px, 100.0))
 
-    assert score_momentum(0.013) == 10
-    assert score_momentum(0.007) == 6
-    assert score_momentum(0.001) == 2
-    assert score_momentum(-0.001) == 0
+    s = build_signal(
+        market="KRW-HOT",
+        candles=candles,
+        notional_ratio=10.0,
+        spread_pct=0.0005,
+        depth_ratio=10.0,
+        btc_regime_ok=True,
+        notional_ratio_min=0.9,
+    )
+
+    assert s.tradable is False
+    assert "REJECT_RSI_HOT" in (s.note or "")
+
+
+def test_build_signal_notional_ratio_veto():
+    candles = []
+    px = 100.0
+    for i in range(120):
+        px *= 1.0005
+        candles.append(_make_candle(0 + i * 60_000, px * 0.999, px * 1.001, px * 0.998, px, 50.0))
+
+    s = build_signal(
+        market="KRW-LOWVOL",
+        candles=candles,
+        notional_ratio=0.1,
+        spread_pct=0.0005,
+        depth_ratio=10.0,
+        btc_regime_ok=True,
+        notional_ratio_min=0.9,
+    )
+
+    assert s.tradable is False
+    assert "REJECT_VOL" in (s.note or "")

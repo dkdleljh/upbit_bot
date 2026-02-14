@@ -296,7 +296,33 @@ class TradingStateMachine:
                 p = self.portfolio.remove(market) or p
                 try:
                     # 시장가로 즉시 던짐
-                    await self.exec_engine.execute_market(market, "SELL", 0, p.qty, current_price, 0.002, "stop_loss_ws")
+                    try:
+                        self.storage.log_event(
+                            "INFO",
+                            "SELL_ATTEMPT",
+                            market,
+                            f"reason=stop_loss_ws ratio=1.000 qty={p.qty:.8f} px={current_price:.4f} val_krw=0",
+                        )
+                    except Exception:
+                        pass
+
+                    res = await self.exec_engine.execute_market(market, "SELL", 0, p.qty, current_price, 0.002, "stop_loss_ws")
+                    if not res.ok:
+                        try:
+                            self.storage.log_event("WARN", "SELL_FAIL", market, f"reason={res.reason} action=stop_loss_ws")
+                        except Exception:
+                            pass
+                    else:
+                        try:
+                            self.storage.log_event(
+                                "INFO",
+                                "SELL_OK",
+                                market,
+                                f"fill_px={res.fill_price:.4f} qty={float(res.qty):.8f} action=stop_loss_ws",
+                            )
+                        except Exception:
+                            pass
+
                     LOGGER.info(f"WS STOP LOSS triggered for {market} at {current_price}")
                 finally:
                     self._exit_inflight.discard(market)
@@ -1013,17 +1039,41 @@ class TradingStateMachine:
                 else:
                     removed = p
                 try:
+                    try:
+                        self.storage.log_event(
+                            "INFO",
+                            "SELL_ATTEMPT",
+                            market,
+                            f"reason={a['reason']} ratio={a['ratio']:.3f} qty={qty:.8f} px={px:.4f} val_krw={val:.0f}",
+                        )
+                    except Exception:
+                        pass
+
                     res = await self.exec_engine.execute_market(market, "SELL", val, qty, px, slip_est, a["reason"])
                 finally:
                     self._exit_inflight.discard(market)
 
                 if not res.ok:
                     self.risk.stats.order_errors += 1
+                    try:
+                        self.storage.log_event("WARN", "SELL_FAIL", market, f"reason={res.reason} action={a['reason']}")
+                    except Exception:
+                        pass
                     self._record_order_error_and_maybe_pause(res.reason)
                     # 실패했고 전량청산으로 이미 제거했으면 복구
                     if a["ratio"] >= 0.999:
                         self.portfolio.positions[market] = removed
                     continue
+
+                try:
+                    self.storage.log_event(
+                        "INFO",
+                        "SELL_OK",
+                        market,
+                        f"fill_px={res.fill_price:.4f} qty={float(res.qty):.8f} action={a['reason']}",
+                    )
+                except Exception:
+                    pass
 
                 # 손익은 KRW 기준으로 기록해야 RiskManager/EQ가 정상 동작합니다.
                 quote = parse_market(market).quote
@@ -1099,7 +1149,35 @@ class TradingStateMachine:
             quote_krw = 1.0
         val = qty * px * quote_krw
         slip_est = self.exec_engine.estimate_slippage(worst_market, 0.001)
-        await self.exec_engine.execute_market(worst_market, "SELL", val, qty, px, slip_est, "replacement_out")
+        try:
+            self.storage.log_event(
+                "INFO",
+                "SELL_ATTEMPT",
+                worst_market,
+                f"reason=replacement_out ratio=1.000 qty={qty:.8f} px={px:.4f} val_krw={val:.0f}",
+            )
+        except Exception:
+            pass
+
+        res = await self.exec_engine.execute_market(worst_market, "SELL", val, qty, px, slip_est, "replacement_out")
+        if not res.ok:
+            try:
+                self.storage.log_event("WARN", "SELL_FAIL", worst_market, f"reason={res.reason} action=replacement_out")
+            except Exception:
+                pass
+            self._record_order_error_and_maybe_pause(res.reason)
+            return
+
+        try:
+            self.storage.log_event(
+                "INFO",
+                "SELL_OK",
+                worst_market,
+                f"fill_px={res.fill_price:.4f} qty={float(res.qty):.8f} action=replacement_out",
+            )
+        except Exception:
+            pass
+
         self.portfolio.remove(worst_market)
         self.replacement_events.append(now_ms())
 

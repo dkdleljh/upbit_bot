@@ -29,9 +29,23 @@ pip install aiohttp pyyaml numpy pandas pytest
 ```
 
 2) live 모드용 API 키(필수, paper/backtest는 불필요)
+
+⚠️ **주의(중요)**
+- 아래 값은 "예시"입니다. 문서/코드/레포 안에 실제 키를 적지 마세요.
+- 키는 `.env`(Git에 커밋되지 않음) 또는 `~/.upbit_bot.env` 같은 로컬 전용 파일에만 보관하세요.
+
+예시(환경변수로 주입):
 ```bash
-export UPBIT_ACCESS_KEY="여기에_액세스키"
-export UPBIT_SECRET_KEY="여기에_시크릿키"
+export UPBIT_ACCESS_KEY="YOUR_UPBIT_ACCESS_KEY"
+export UPBIT_SECRET_KEY="YOUR_UPBIT_SECRET_KEY"
+```
+
+권장(로컬 .env 사용):
+```bash
+cd /home/zenith/Desktop/upbit_bot
+cp .env.example .env
+nano .env
+# git status에서 .env가 보이면(추적되면) 안 됩니다.
 ```
 
 ## 4. 실행 방법

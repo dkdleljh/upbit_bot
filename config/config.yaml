@@ -26,6 +26,8 @@ signal:
   timeframe_main: 1m
   timeframe_filter: 5m
   breakout_lookback_minutes: 20
+  # signal model profile: full(default) | simple(lite)
+  profile: simple
   # (승률형) 거래대금 비율 컷을 높여 잡음 진입을 줄입니다.
   notional_ratio_min: 0.9
 
@@ -44,18 +46,29 @@ risk:
 stops:
   atr_period: 14
   atr_timeframe: 1m
-  atr_multiplier: 1.6
-  stop_pct_min: 0.009
-  stop_pct_max: 0.025
-  # 스나이퍼 모드: 1.0% 수익 시 절반 익절 (승률 확보)
-  tp_net_pnl_pct: 0.013 
+  atr_multiplier: 1.5
+  stop_pct_min: 0.008
+  stop_pct_max: 0.020
+  tp_net_pnl_pct: 0.015 
   tp1_ratio: 0.5
-  trailing_stop_pct: 0.012 
+  tp2_ratio: 0.3
+  trailing_stop_pct: 0.010 
+
+regime:
+  volatility_high_threshold: 1.5
+  volatility_low_threshold: 0.6
+  regime_lookback_period: 50
+  regime_adaptive_tp_high: 1.3
+  regime_adaptive_tp_low: 0.8
+  regime_adaptive_trailing_high: 1.2
+  regime_adaptive_trailing_low: 0.9
+  position_size_high_vol: 0.6
+  position_size_low_vol: 1.2
 
 time_rules:
-  min_hold_seconds: 60 # 90 -> 60 (더 빠르게)
-  soft_cut_minutes: 20 # 8 -> 5 (안 가면 빨리 자르기)
-  soft_cut_progress: 0.01
+  min_hold_seconds: 60
+  soft_cut_minutes: 20
+  soft_cut_progress: 0.02
   hard_exit_minutes: 60
 
 replace:
@@ -66,7 +79,7 @@ replace:
     trend_ok_drawdown_from_peak: 0.008
     replace_if_pnl_below: -0.008
 
-min_notional_krw: 10000
+min_notional_krw: 5000
 
 dust:
   # 평상시에는 더스트가 생기지 않게(진입 금액 상향, 매도 수량 동기화, 최소금액 미만은 무시)
@@ -77,6 +90,8 @@ dust:
   topup_max_krw: 20000
   # 더스트 처리 중 동일 코인 반복 매수/매도 루프 방지
   topup_cooldown_seconds: 1800
+  # 손절 매도 금액이 최소 주문금액 미만일 때 동일 이벤트 반복 루프 방지
+  stoploss_under_min_notional_cooldown_seconds: 600
 
 daily_report:
   hour: 0
@@ -92,6 +107,8 @@ runtime:
   paper_initial_equity_krw: 10000000
   backtest_days: 3
   backtest_default_slippage: 0.002
+  # 손절 최악 구간에서도(min_entry * (1 - stop_pct_max)) 최소 주문금액을 유지하도록 진입 최소값 설정
+  min_entry_krw: 5500
   safe_mode_error_threshold: 5
   # 실계좌 기반 평가금액(미실현손익 포함) 스냅샷 저장 주기
   equity_snapshot_seconds: 300
@@ -103,6 +120,12 @@ live:
   manage_existing_positions: false
   # 기존보유 복원 포지션은 즉시 WS 손절을 걸면 과매도/휩쏘 위험이 있어 유예시간을 둡니다(초)
   restored_stoploss_grace_seconds: 300
+
+  # (추천값) WS 손절 발생 코인은 신규진입을 일정 시간 차단(시장 급변/루프 방지)
+  # - 손절이 반복되면(윈도우 내) 30m → 60m → 120m … 단계적으로 증가
+  market_quarantine_on_stoploss_minutes: 30
+  market_quarantine_max_minutes: 360
+  market_quarantine_stoploss_window_seconds: 3600
 
   # Circuit Breaker: 손절이 연속으로 터질 때 자동으로 신규 진입을 잠시 중단
   circuit_breaker:
@@ -126,3 +149,5 @@ live:
   order_dedup_entry_seconds: 10
   order_dedup_exit_seconds: 5
   order_dedup_stop_seconds: 2
+  # 일반 SELL(익절/시간청산) 지정가 대기 시간(초). 초과 시 시장가 fallback
+  sell_limit_wait_seconds: 2.0

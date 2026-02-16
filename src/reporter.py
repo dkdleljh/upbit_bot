@@ -16,6 +16,7 @@ class Reporter:
     def __init__(self, cfg, storage, report_dir):
         self.cfg = cfg
         self.storage = storage
+        self.db_path = getattr(storage, "db_path", None)
         self.report_dir = report_dir
         os.makedirs(report_dir, exist_ok=True)
 
@@ -24,6 +25,10 @@ class Reporter:
 
     def export_today(self):
         try:
+            if not hasattr(self.storage, "query"):
+                LOGGER.error("Reporter storage is invalid: missing query()")
+                return
+
             today = datetime.now().strftime("%Y-%m-%d")
             report_path = os.path.join(self.report_dir, f"Daily_Report_{today}.md")
 

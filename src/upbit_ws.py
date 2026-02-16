@@ -2,6 +2,7 @@ import asyncio
 import json
 import logging
 import uuid
+from collections import deque
 from typing import Callable, Optional
 
 import websockets
@@ -42,10 +43,12 @@ class UpbitWebSocket:
         LOGGER.info("WebSocket stopped")
 
     async def _connect_loop(self):
+        retry_s = 1.0
         while self._running:
             try:
                 async with websockets.connect(self.uri, ping_interval=60, ping_timeout=20) as ws:
                     self.connected = True
+                    retry_s = 1.0
                     LOGGER.info("WebSocket connected!")
                     
                     # 구독 메시지 전송
@@ -79,11 +82,12 @@ class UpbitWebSocket:
                             break
             
             except Exception as e:
-                LOGGER.error(f"WebSocket connection failed: {e}. Retrying in 5s...")
+                LOGGER.error(f"WebSocket connection failed: {e}. Retrying in {retry_s:.1f}s...")
                 self.connected = False
             
-            # 연결 종료/실패 후 반드시 대기 (무한 재접속 방지)
-            await asyncio.sleep(5)
+            # 연결 종료/실패 후 지수 백오프로 재접속 (무한 재접속 폭주 방지)
+            await asyncio.sleep(retry_s)
+            retry_s = min(30.0, retry_s * 2.0)
 
 
 class MarketCache:
@@ -93,7 +97,7 @@ class MarketCache:
         # {market: orderbook_dict}
         self.orderbooks: dict[str, dict] = {}
         # {market: deque[candle_dict]}
-        self.candles: dict[str, object] = {} # deque는 async 처리 중 import 해서 사용
+        self.candles: dict[str, deque] = {}
 
     async def seed_tickers(self, tickers: list[dict]):
         for t in tickers:
@@ -104,7 +108,6 @@ class MarketCache:
             self.orderbooks[ob["market"]] = ob
 
     async def push_candle(self, market: str, candle: dict):
-        from collections import deque
         if market not in self.candles:
             self.candles[market] = deque(maxlen=200)
         

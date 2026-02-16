@@ -1,12 +1,12 @@
 import asyncio
 import logging
 import random
-from collections import deque, defaultdict
+from collections import deque
 
 from .execution import ExecutionEngine
 from .indicators import atr, ema, rsi, stop_pct_from_atr
 from .portfolio import Portfolio
-from .signal_engine import build_signal
+from .signal_engine import build_signal, build_signal_simple
 from .universe import select_universe
 from .utils import now_ms, parse_market
 
@@ -14,7 +14,15 @@ LOGGER = logging.getLogger(__name__)
 
 
 def run_backtest_30d(cfg: dict) -> dict:
-    """MVP 백테스트 근사 결과."""
+    """Legacy 백테스트 (단순 시뮬레이션 - 실제 데이터 기반 아님).
+    
+    경고: 이 함수는 실제 백테스트 결과가 아닌 근사값을 반환합니다.
+    정확한 백테스트를 원하시면 config의 backtest_days 설정을 사용하세요.
+    """
+    import logging
+    LOGGER = logging.getLogger(__name__)
+    LOGGER.warning("LEGACY BACKTEST: Using estimated results (not actual data-driven). Use config backtest_days for accurate results.")
+    
     total = 220
     wins = 118
     net_pnl = random.uniform(-0.03, 0.08)
@@ -99,6 +107,10 @@ class TradingStateMachine:
         self._entry_pause_until_ms: int = 0
         self._entry_pause_logged: bool = False
 
+        # --- Market quarantine (per-market) ---
+        # WS 손절/주문오류가 반복되는 코인을 일정 시간 격리하여 루프를 끊습니다.
+        self._market_stoploss_events_ms: dict[str, deque[int]] = {}
+
         # --- 시장별 직렬화 락(진입/청산/포지션 업데이트 레이스 방지) ---
         self._market_locks: dict[str, asyncio.Lock] = {}
 
@@ -113,6 +125,15 @@ class TradingStateMachine:
         self._last_ticker_refresh_ms: int = 0
         self._last_orderbook_refresh_ms: int = 0
 
+        # 운영 상태 추적 (헬스체크/관측용)
+        self._last_ws_tick_ms: int = 0
+        self._last_ws_tick_market: str | None = None
+        self._last_ws_tick_event_ms: int = 0
+        self._last_candle_success_ms: dict[str, int] = {}
+
+        # 종료 제어
+        self._stop_event: asyncio.Event | None = None
+
     def _lock_for(self, market: str) -> asyncio.Lock:
         lock = self._market_locks.get(market)
         if lock is None:
@@ -123,7 +144,7 @@ class TradingStateMachine:
     async def initialize(self):
         # 0) 마켓 목록 확보
         try:
-            self.all_markets = await self.rest.get_markets()
+            self.all_markets = await self._call_with_retry(lambda: self.rest.get_markets(), name="get_markets_init") or []
         except Exception as e:
             LOGGER.warning("get_markets failed: %s", e)
             self.all_markets = []
@@ -138,7 +159,7 @@ class TradingStateMachine:
                     seed_markets.append(m)
 
             try:
-                tickers = await self.rest.get_tickers(seed_markets)
+                tickers = await self._call_with_retry(lambda: self.rest.get_tickers(seed_markets), name="seed_tickers") or []
             except Exception as e:
                 LOGGER.warning("seed tickers failed: %s", e)
                 tickers = []
@@ -146,7 +167,7 @@ class TradingStateMachine:
                 await self.cache.seed_tickers(tickers)
 
             try:
-                obs = await self.rest.get_orderbook(seed_markets[:30])
+                obs = await self._call_with_retry(lambda: self.rest.get_orderbook(seed_markets[:30]), name="seed_orderbook") or []
             except Exception as e:
                 LOGGER.warning("seed orderbook failed: %s", e)
                 obs = []
@@ -174,14 +195,16 @@ class TradingStateMachine:
         if self._ws_consumer_task is None or self._ws_consumer_task.done():
             self._ws_consumer_task = asyncio.create_task(self._ws_consumer_loop())
 
-    async def run(self):
+    async def run(self, stop_event: asyncio.Event | None = None):
+        self._stop_event = stop_event
         await self.initialize()
         await self.reporter.start()
         
         # 하이브리드 모드:
         # 1. WS: 실시간 시세 수신 -> 손절(SL) 감시 (0.1초 반응)
         # 2. Loop: 10초마다 진입/익절 판단 (10초 반응)
-        while True:
+        loop_interval = max(1.0, float(self.cfg.get("runtime", {}).get("loop_interval_seconds", 10)))
+        while not (self._stop_event and self._stop_event.is_set()):
             try:
                 await self._cycle()
                 
@@ -206,8 +229,30 @@ class TradingStateMachine:
 
             except Exception as e:
                 LOGGER.exception("Main Loop Error: %s", e)
-            
-            await asyncio.sleep(10) # 10초 주기
+
+            # 10초 고정 슬립 대신 stop_event를 기다려 빠른 종료를 지원
+            try:
+                if self._stop_event is not None:
+                    await asyncio.wait_for(self._stop_event.wait(), timeout=loop_interval)
+                else:
+                    await asyncio.sleep(loop_interval)
+            except asyncio.TimeoutError:
+                pass
+
+        await self.shutdown()
+
+    async def shutdown(self):
+        try:
+            if self._ws_consumer_task is not None:
+                self._ws_consumer_task.cancel()
+                try:
+                    await self._ws_consumer_task
+                except asyncio.CancelledError:
+                    pass
+            if self.ws is not None:
+                await self.ws.stop()
+        except Exception as e:
+            LOGGER.warning("state machine shutdown warning: %s", e)
 
     def _on_ws_data(self, data: dict):
         # WS 콜백에서 create_task를 무한히 만들면 폭주/지연이 생길 수 있어 큐로 넘깁니다.
@@ -250,12 +295,23 @@ class TradingStateMachine:
     async def _process_ws_data_async(self, data: dict):
         ty = data.get("type")
         code = data.get("code")
+        if not code:
+            return
         
         if ty == "ticker":
             # 1. 시세 업데이트 (캐시 갱신)
             # WS 데이터 포맷 -> Cache 포맷 변환 필요
             # 여기서는 간단히 trade_price만 갱신한다고 가정
             px = float(data.get("trade_price", 0.0))
+            now = now_ms()
+            self._last_ws_tick_ms = now
+            self._last_ws_tick_market = code
+            if now - self._last_ws_tick_event_ms >= 60_000:
+                self._last_ws_tick_event_ms = now
+                try:
+                    self.storage.log_event("INFO", "WS_TICK_OK", code, f"trade_price={px}")
+                except Exception:
+                    pass
             # await self.cache.update_price(code, px) # (가상 메서드)
             
             # 2. 매매 판단 (Fast Path)
@@ -264,6 +320,9 @@ class TradingStateMachine:
             
             # 3. 진입 판단 (Signal Check)
             # 1초에 1번 정도만 체크 (Throttle)
+            # 과거 인스턴스/이상 상태에서 속성이 누락돼도 죽지 않도록 방어
+            if not isinstance(getattr(self, "_last_candle_fetch_ms", None), dict):
+                self._last_candle_fetch_ms = {}
             last_chk = self._last_candle_fetch_ms.get(f"SIG_{code}", 0)
             now = now_ms()
             if now - last_chk > 1000:
@@ -306,7 +365,9 @@ class TradingStateMachine:
                     except Exception:
                         pass
 
-                    res = await self.exec_engine.execute_market(market, "SELL", 0, p.qty, current_price, 0.002, "stop_loss_ws")
+                    # SELL의 최소주문금액(더스트) 판단을 위해 대략적인 주문금액을 넘깁니다.
+                    order_value_krw = float(p.qty) * float(current_price)
+                    res = await self.exec_engine.execute_market(market, "SELL", order_value_krw, p.qty, current_price, 0.002, "stop_loss_ws")
                     if not res.ok:
                         try:
                             self.storage.log_event("WARN", "SELL_FAIL", market, f"reason={res.reason} action=stop_loss_ws")
@@ -329,6 +390,36 @@ class TradingStateMachine:
 
                 # Circuit breaker 기록/판정 (손절 연속 시 신규진입 일시중단)
                 self._record_stoploss_and_maybe_pause()
+
+                # market 단위 격리(추천값): WS 손절이 반복되는 코인은 단계적으로 격리 시간을 늘려 루프를 차단
+                try:
+                    live_cfg = (self.cfg.get("live", {}) or {})
+                    base_min = int(live_cfg.get("market_quarantine_on_stoploss_minutes", 30) or 30)
+                    max_min = int(live_cfg.get("market_quarantine_max_minutes", 360) or 360)
+                    window_s = int(live_cfg.get("market_quarantine_stoploss_window_seconds", 3600) or 3600)
+
+                    dq = self._market_stoploss_events_ms.get(market)
+                    if dq is None:
+                        dq = deque(maxlen=10)
+                        self._market_stoploss_events_ms[market] = dq
+                    nowv = now_ms()
+                    dq.append(nowv)
+                    # prune window
+                    while dq and (nowv - dq[0] > window_s * 1000):
+                        dq.popleft()
+
+                    hits = len(dq)
+                    # 1회: base, 2회: 2x, 3회: 4x ... (cap)
+                    q_min = min(max_min, base_min * (2 ** max(0, hits - 1)))
+                    self.exec_engine.cooldown_until_ms[market] = nowv + q_min * 60_000
+
+                    try:
+                        self.storage.log_event("WARN", "MARKET_QUARANTINE", market, f"reason=stoploss_ws hits={hits} window_s={window_s} minutes={q_min}")
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
+
                 try:
                     self.storage.log_event("WARN", "STOPLOSS_WS", market, f"px={current_price}")
                 except Exception:
@@ -341,27 +432,6 @@ class TradingStateMachine:
             # 여기서는 SL만 WS로 처리하여 방어력 극대화
 
     async def _check_entry_signal(self, market: str):
-        # 기존 _cycle의 진입 로직을 단일 마켓용으로 이식
-        if self.safe_mode:
-            return
-        if now_ms() < self._entry_pause_until_ms:
-            return
-        if self.exec_engine.is_cooldown(market):
-            return
-        
-        # 유니버스 TOP10 아니면 패스
-        if market not in self.universe_top10: return
-
-        # 캔들 데이터 가져오기 (WS로 받은 틱으로 캔들 업데이트가 안 되었다면 REST 사용해야 함)
-        # 하지만 WS로 캔들 생성이 어려우므로, 여기서는 Cache된 캔들 사용
-        candles = await self.cache.get_candles(market)
-        if not candles: return # 데이터 부족
-
-        # ... (기존 build_signal 호출) ...
-        # 여기서는 신속한 구현을 위해 기존 로직 호출
-        
-        # [주의] 이 부분은 전체 로직 재사용이 필요함.
-        # 일단은 로그만 찍어보겠습니다.
         pass
 
     async def _cycle_maintenance(self):
@@ -371,10 +441,12 @@ class TradingStateMachine:
         await self._snapshot_positions({}) # last_prices는 WS 캐시에서 가져와야 함
 
     async def _cycle(self):
+        now = now_ms()
+
         # live 모드에서만 safe_mode 발동 (paper 모드는 공용 API 429로 인한 진입 차단 방지)
         if self.mode == "live" and self.rest.error_count >= self.cfg["runtime"]["safe_mode_error_threshold"]:
             if not self.safe_mode:
-                self._safe_mode_since_ms = now_ms()
+                self._safe_mode_since_ms = now
                 try:
                     self.storage.log_event("ERROR", "SAFE_MODE_ON", None, f"error_count={self.rest.error_count}")
                 except Exception:
@@ -402,7 +474,6 @@ class TradingStateMachine:
                     pass
 
         # entry pause 상태 변화를 이벤트로 남김
-        now = now_ms()
         if now < self._entry_pause_until_ms:
             if not self._entry_pause_logged:
                 self._entry_pause_logged = True
@@ -424,12 +495,20 @@ class TradingStateMachine:
             self._last_heartbeat_event_ms = now
             try:
                 paused_left = max(0, int((self._entry_pause_until_ms - now) / 1000))
+                last_ws_age_s = -1 if self._last_ws_tick_ms <= 0 else int((now - self._last_ws_tick_ms) / 1000)
+                if self._last_candle_success_ms:
+                    last_candle_ms = max(self._last_candle_success_ms.values())
+                    last_candle_age_s = int((now - last_candle_ms) / 1000)
+                else:
+                    last_candle_age_s = -1
                 self.storage.log_event(
                     "INFO",
                     "STRATEGY_HEARTBEAT",
                     None,
                     f"mode={self.mode} safe_mode={self.safe_mode} err_count={getattr(self.rest,'error_count',None)} "
-                    f"positions={len(self.portfolio.positions)} paused_left_s={paused_left} ws_q={self._ws_in_q.qsize()} drops={self._ws_drop_count}",
+                    f"positions={len(self.portfolio.positions)} paused_left_s={paused_left} ws_q={self._ws_in_q.qsize()} "
+                    f"drops={self._ws_drop_count} last_ws_tick_age_s={last_ws_age_s} "
+                    f"last_ws_market={self._last_ws_tick_market or '-'} last_candle_age_s={last_candle_age_s}",
                 )
             except Exception:
                 pass
@@ -448,22 +527,16 @@ class TradingStateMachine:
         # 5분봉 데이터(MTF) 조회 - Top10 종목 대상
         mtf_trends = {}
         for m in self.universe_top10:
-            # 5분봉 20개 조회 (단기 추세 확인용)
-            c5 = await self.rest.get_candles_minutes(m, unit=5, count=20)
+            c5 = await self._call_with_retry(lambda: self.rest.get_candles_minutes(m, unit=5, count=20), name=f"get_candles_5m:{m}") or []
             if len(c5) >= 20:
                 closes5 = [float(x["trade_price"]) for x in reversed(c5)]
-                # EMA20 > EMA60 (정배열) 여부 확인
-                # 여기서는 간단히 EMA20 상승 추세 여부로 판단 (현재가 > EMA20)
-                # 정석: ema(20) > ema(60)이지만, 데이터 부족 시 ema(20) 기울기로 대체
-                from .indicators import ema
                 ma20_5m = ema(closes5, 20)
-                # 5분봉상 상승 추세(가격이 20이평 위)
                 if ma20_5m and closes5[-1] >= ma20_5m:
                     mtf_trends[m] = True
                 else:
                     mtf_trends[m] = False
             else:
-                mtf_trends[m] = True # 데이터 없으면 관대하게
+                mtf_trends[m] = False
 
         signals = []
         for m in self.universe_top10:
@@ -480,8 +553,12 @@ class TradingStateMachine:
             
             # MTF 추세 전달
             mtf_ok = mtf_trends.get(m, True)
+            ob = orderbooks.get(m)
             
-            sig = build_signal(
+            profile = str((self.cfg.get("signal", {}) or {}).get("profile", "full")).lower()
+            builder = build_signal_simple if profile in {"simple", "lite"} else build_signal
+
+            sig = builder(
                 market=m,
                 candles=candles,
                 notional_ratio=notional_ratio,
@@ -489,7 +566,8 @@ class TradingStateMachine:
                 depth_ratio=depth_ratio,
                 btc_regime_ok=btc_ok,
                 notional_ratio_min=float(self.cfg["signal"]["notional_ratio_min"]),
-                mtf_trend_ok=mtf_ok, # 5분봉 추세
+                mtf_trend_ok=mtf_ok,
+                orderbook=ob,
             )
             signals.append(sig)
 
@@ -512,7 +590,7 @@ class TradingStateMachine:
             )
 
         signals.sort(key=lambda x: x.score, reverse=True)
-        await self._process_exits(last_prices)
+        await self._process_exits(last_prices, orderbooks)
         await self._process_entries(signals, last_prices, orderbooks)
         await self._snapshot_positions(last_prices)
 
@@ -534,7 +612,7 @@ class TradingStateMachine:
         top30_markets = [x["market"] for x in top30_candidates]
 
         # 2) top30 후보의 orderbook을 다시 수집해서 캐시에 채움
-        fetched = await self.rest.get_orderbook(top30_markets)
+        fetched = await self._call_with_retry(lambda: self.rest.get_orderbook(top30_markets), name="refresh_universe_orderbook") or []
         if not fetched:
             fetched = self._mock_orderbooks(top30_markets, tickers_list)
 
@@ -567,7 +645,7 @@ class TradingStateMachine:
         self._last_live_sync_ms = now
 
         try:
-            accts = await self.rest.get_accounts()
+            accts = await self._call_with_retry(lambda: self.rest.get_accounts(), name="get_accounts_sync")
         except Exception:
             return
         if not isinstance(accts, list):
@@ -662,7 +740,7 @@ class TradingStateMachine:
                 assets.append((cur, qty_total, avg))
 
             markets = [f"KRW-{cur}" for cur, _, _ in assets]
-            tickers = await self.rest.get_tickers(markets) if markets else []
+            tickers = await self._call_with_retry(lambda: self.rest.get_tickers(markets), name="get_tickers_equity") if markets else []
             px = {t.get("market"): float(t.get("trade_price") or 0.0) for t in (tickers or [])}
 
             asset_value = 0.0
@@ -838,6 +916,9 @@ class TradingStateMachine:
 
         for s in tradables[:5]: # 상위 5개까지만 검토
             market = s.market
+            # 마켓 격리/쿨다운(WS 손절 등) 중이면 진입 금지
+            if self.exec_engine.is_cooldown(market):
+                continue
             # 중복 진입 방지
             if market in self._entry_inflight:
                 continue
@@ -883,10 +964,12 @@ class TradingStateMachine:
             # --- 공통 진입 실행 로직 ---
             candles = await self.cache.get_candles(market)
             atr_v = atr(candles, period=self.cfg["stops"]["atr_period"])
+            vol_regime = s.volatility_regime
+            atr_mult = self.risk.get_adaptive_atr_multiplier(vol_regime)
             stop_pct = stop_pct_from_atr(
                 px,
                 atr_v,
-                self.cfg["stops"]["atr_multiplier"],
+                atr_mult,
                 self.cfg["stops"]["stop_pct_min"],
                 self.cfg["stops"]["stop_pct_max"],
             )
@@ -897,7 +980,7 @@ class TradingStateMachine:
             # Phase 2: 점수에 따른 배팅 금액 조절 (동적 컷오프 적용)
             # 동적 컷오프보다 점수가 훨씬 높으면(예: +10점) 과감하게 베팅
             score_bonus = max(0, s.score - s.dynamic_cutoff)
-            pos_value = self.risk.compute_position_value(stop_pct, len(tradables), coin_exposure_now, signal_score=85 + score_bonus)
+            pos_value = self.risk.compute_position_value(stop_pct, len(tradables), coin_exposure_now, signal_score=85 + score_bonus, volatility_regime=vol_regime)
             
             if pos_value < self.cfg["min_notional_krw"]:
                 continue
@@ -950,13 +1033,40 @@ class TradingStateMachine:
                 self._entry_inflight.discard(market)
 
             if not res.ok:
-                self.risk.stats.order_errors += 1
+                r = str(res.reason or "")
+
+                # 정책적/기술적 스킵은 '오류'로 누적하지 않음 (전략 평가 왜곡 방지)
+                is_skip = r in {
+                    "dedup_block",
+                    "daily_trade_limit",
+                    "live_insufficient_krw",
+                    "live_confirm_missing",
+                    "kill_switch_on",
+                }
+
+                # dedup_block은 짧은 쿨다운을 걸어 루프를 끊습니다.
+                if r == "dedup_block":
+                    try:
+                        self.exec_engine.cooldown_until_ms[market] = now_ms() + 60_000
+                    except Exception:
+                        pass
+
+                if not is_skip:
+                    self.risk.stats.order_errors += 1
+
                 try:
                     self.storage.log_event("WARN", "BUY_FAIL", market, f"reason={res.reason}")
                 except Exception:
                     pass
-                # 주문 오류가 연속되면 신규 진입을 잠시 멈춤(서킷 브레이커)
-                self._record_order_error_and_maybe_pause(res.reason)
+
+                if not is_skip:
+                    # 주문 오류가 연속되면 신규 진입을 잠시 멈춤(서킷 브레이커)
+                    self._record_order_error_and_maybe_pause(res.reason)
+                else:
+                    try:
+                        self.storage.log_event("WARN", "BUY_SKIP", market, f"reason={res.reason}")
+                    except Exception:
+                        pass
                 continue
 
             # 포트폴리오 업데이트 (신규 or 추가)
@@ -972,7 +1082,7 @@ class TradingStateMachine:
 
             if market not in self.portfolio.positions:
                 stop_price = res.fill_price * (1 - stop_pct)
-                self.portfolio.add(market, filled_qty, res.fill_price, stop_price, s.score)
+                self.portfolio.add(market, filled_qty, res.fill_price, stop_price, s.score, volatility_regime=s.volatility_regime)
                 try:
                     self.storage.log_event("INFO", "BUY_OK", market, f"fill_px={res.fill_price:.4f} qty={filled_qty:.8f}")
                 except Exception:
@@ -1004,16 +1114,31 @@ class TradingStateMachine:
             prev = self.risk.stats.avg_entry_slippage
             self.risk.stats.avg_entry_slippage = ((prev * (n - 1)) + res.slippage_pct) / n
 
-    async def _process_exits(self, last_prices):
+    async def _process_exits(self, last_prices, orderbooks=None):
+        """청산 로직.
+
+        개선(추천값): SELL 주문의 ref_price를 ticker(trade_price) 대신 orderbook bid1로 잡아
+        불필요한 '미체결 -> 시장가 던지기'를 줄여 저가 체결 위험을 낮춥니다.
+        """
+        orderbooks = orderbooks or {}
         for market, p0 in list(self.portfolio.positions.items()):
             # WS 손절과 동시에 청산 루프가 돌면 중복 매도가 날 수 있어 가드
             if market in self._exit_inflight:
                 continue
 
-            px = last_prices.get(market, p0.entry_price)
+            # 기본은 ticker 기반 현재가
+            px_ticker = last_prices.get(market, p0.entry_price)
+
+            # SELL은 bid1 기준으로 지정가 체결 유도 (없으면 ticker fallback)
+            ob = orderbooks.get(market) or {}
+            units = (ob.get("orderbook_units") or [])
+            bid1 = float(units[0].get("bid_price", 0.0)) if units else 0.0
+            px = bid1 if bid1 > 0 else px_ticker
+
             fee_rate = float(self.cfg["fees"].get(market.split("-")[0], 0.001))
             slip_est = self.exec_engine.estimate_slippage(market, 0.001)
-            actions = self.portfolio.evaluate_exits(market, px, fee_rate, slip_est)
+            vol_regime = p0.volatility_regime
+            actions = self.portfolio.evaluate_exits(market, px, fee_rate, slip_est, volatility_regime=vol_regime)
             for a in actions:
                 # 액션 실행 직전 최신 포지션을 다시 읽음(중간에 WS가 제거했을 수 있음)
                 p = self.portfolio.positions.get(market)
@@ -1054,14 +1179,39 @@ class TradingStateMachine:
                     self._exit_inflight.discard(market)
 
                 if not res.ok:
-                    self.risk.stats.order_errors += 1
+                    r = str(res.reason or "")
+                    # 손절 더스트(최소주문금액 미만)는 반복 오류 루프를 만들 수 있어
+                    # 주문오류 카운트/서킷브레이커 집계에서 제외합니다.
+                    is_stoploss_dust = r.startswith("stoploss_under_min_notional")
+
+                    # 더스트 처리 쿨다운/최소주문금액 미만 등은 '오류'라기보다 정책적 스킵이므로
+                    # order_errors/서킷브레이커에 반영하지 않습니다.
+                    is_dust_skip = r in {"dust_topup_cooldown", "live_under_min_notional"}
+
+                    if not (is_stoploss_dust or is_dust_skip):
+                        self.risk.stats.order_errors += 1
+
                     try:
                         self.storage.log_event("WARN", "SELL_FAIL", market, f"reason={res.reason} action={a['reason']}")
                     except Exception:
                         pass
-                    self._record_order_error_and_maybe_pause(res.reason)
+
+                    if not (is_stoploss_dust or is_dust_skip):
+                        self._record_order_error_and_maybe_pause(res.reason)
+                    else:
+                        try:
+                            self.storage.log_event(
+                                "WARN",
+                                "SELL_SKIP_DUST",
+                                market,
+                                f"action={a['reason']} reason={res.reason}",
+                            )
+                        except Exception:
+                            pass
+
                     # 실패했고 전량청산으로 이미 제거했으면 복구
-                    if a["ratio"] >= 0.999:
+                    # 단, 손절 더스트는 반복 루프 방지를 위해 복구하지 않습니다.
+                    if a["ratio"] >= 0.999 and not is_stoploss_dust:
                         self.portfolio.positions[market] = removed
                     continue
 
@@ -1088,6 +1238,10 @@ class TradingStateMachine:
                 pnl_quote = (res.fill_price - removed.entry_price) * qty - res.fee
                 pnl_value = pnl_quote * quote_krw
                 self.risk.update_realized(pnl_value)
+                
+                pnl_pct = (res.fill_price - removed.entry_price) / removed.entry_price if removed.entry_price > 0 else 0
+                is_win = pnl_pct > 0
+                self.risk.update_trade_result(is_win, pnl_pct)
 
                 if a["ratio"] < 0.999:
                     # 부분 청산 반영
@@ -1185,6 +1339,8 @@ class TradingStateMachine:
         if not self.all_markets:
             return
         now = now_ms()
+        if not isinstance(getattr(self, "_last_candle_fetch_ms", None), dict):
+            self._last_candle_fetch_ms = {}
 
         # tickers는 60초에 1회만 갱신(429 방지). KRW/BTC/USDT 모두 일부 포함.
         if now - self._last_ticker_refresh_ms >= 60_000:
@@ -1193,7 +1349,7 @@ class TradingStateMachine:
             btc = [m for m in self.all_markets if m.startswith("BTC-")][:60]
             usdt = [m for m in self.all_markets if m.startswith("USDT-")][:60]
             markets = krw + btc + usdt
-            tickers = await self.rest.get_tickers(markets)
+            tickers = await self._call_with_retry(lambda: self.rest.get_tickers(markets), name="get_tickers") or []
             if not tickers:
                 tickers = self._mock_tickers(markets)
             await self.cache.seed_tickers(tickers)
@@ -1208,7 +1364,7 @@ class TradingStateMachine:
             btc_ob = [m for m in self.all_markets if m.startswith("BTC-")][:5]
             usdt_ob = [m for m in self.all_markets if m.startswith("USDT-")][:5]
             ob_markets = krw_ob + btc_ob + usdt_ob
-            orderbooks = await self.rest.get_orderbook(ob_markets)
+            orderbooks = await self._call_with_retry(lambda: self.rest.get_orderbook(ob_markets), name="get_orderbook") or []
             if not orderbooks:
                 # tickers가 비어도 mock orderbook 생성은 가능
                 orderbooks = self._mock_orderbooks(ob_markets, tickers or self._mock_tickers(ob_markets))
@@ -1223,7 +1379,7 @@ class TradingStateMachine:
             self._last_candle_fetch_ms[m] = now
 
             # 신호엔진에서 EMA60 등 60개 이상이 필요하므로, 초기부터 충분한 길이로 받아옵니다.
-            candles = await self.rest.get_candles_minutes(m, unit=1, count=120)
+            candles = await self._call_with_retry(lambda: self.rest.get_candles_minutes(m, unit=1, count=120), name=f"get_candles_minutes:{m}") or []
             if candles:
                 for c in reversed(candles):
                     # Upbit 분봉 응답에는 candle 시각이 포함됩니다.
@@ -1260,6 +1416,11 @@ class TradingStateMachine:
                         )
                     except Exception:
                         pass
+                self._last_candle_success_ms[m] = now_ms()
+                try:
+                    self.storage.log_event("INFO", "CANDLE_FETCH_OK", m, f"candles={len(candles)}")
+                except Exception:
+                    pass
             else:
                 # 실패 시에만 mock 데이터 사용
                 t = next((t for t in tickers if t["market"] == m), None)
@@ -1277,6 +1438,18 @@ class TradingStateMachine:
                             "notional": px * random.uniform(5, 500),
                         }
                         await self.cache.push_candle(m, c)
+
+    async def _call_with_retry(self, fn, *, name: str, retries: int = 3, base_delay_s: float = 0.4):
+        for attempt in range(1, retries + 1):
+            try:
+                return await fn()
+            except Exception as e:
+                if attempt >= retries:
+                    LOGGER.warning("call failed after retries: %s err=%s", name, e)
+                    return None
+                wait = min(5.0, base_delay_s * (2 ** (attempt - 1)))
+                LOGGER.warning("call failed: %s attempt=%d wait=%.2fs err=%s", name, attempt, wait, e)
+                await asyncio.sleep(wait)
 
     def _mock_tickers(self, markets):
         out = []

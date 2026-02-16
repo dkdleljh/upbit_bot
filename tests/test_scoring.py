@@ -71,3 +71,25 @@ def test_build_signal_notional_ratio_veto():
 
     assert s.tradable is False
     assert "REJECT_VOL" in (s.note or "")
+
+
+def test_build_signal_mtf_veto():
+    candles = []
+    px = 100.0
+    for i in range(120):
+        px *= 1.0008
+        candles.append(_make_candle(0 + i * 60_000, px * 0.999, px * 1.001, px * 0.998, px, 120.0))
+
+    s = build_signal(
+        market="KRW-MTF",
+        candles=candles,
+        notional_ratio=10.0,
+        spread_pct=0.0005,
+        depth_ratio=10.0,
+        btc_regime_ok=True,
+        notional_ratio_min=0.9,
+        mtf_trend_ok=False,
+    )
+
+    assert s.tradable is False
+    assert "REJECT_MTF" in (s.note or "")

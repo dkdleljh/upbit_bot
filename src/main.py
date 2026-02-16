@@ -1,9 +1,9 @@
 import argparse
 import asyncio
+import json
 import logging
 import os
 import signal
-import time
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -12,6 +12,7 @@ import fcntl
 from .backtest_engine_simple import BacktestEngine, BacktestResult
 from .backtest_analyzer import BacktestReporter
 from .data_manager import DataManager
+from .notifier import TelegramNotifier, get_notifier, init_notifier
 from .reporter import Reporter
 from .risk import RiskManager
 from .state_machine import TradingStateMachine, run_backtest_30d
@@ -27,6 +28,7 @@ def parse_args():
     p = argparse.ArgumentParser(description="Upbit Multi-Market Scalping Bot MVP")
     p.add_argument("--mode", choices=["live", "paper", "backtest"], default="paper")
     p.add_argument("--config", default="config/config.yaml")
+    p.add_argument("--health", action="store_true", help="헬스체크 실행 후 종료(0/1)")
     return p.parse_args()
 
 
@@ -39,6 +41,11 @@ async def run_trading(mode: str, cfg: dict, storage: Storage):
         secret_key=env_or_none(secret_env),
     )
     reporter = Reporter(cfg, storage, "reports")
+    
+    notifier = get_notifier()
+    if notifier.enabled:
+        initial_equity = float(cfg["runtime"]["paper_initial_equity_krw"])
+        await notifier.notify_startup(mode, initial_equity)
 
     # live 모드에서는 실제 계좌 KRW 잔고를 기준으로 포지션 사이징
     if mode == "live" and rest.is_live_ready:
@@ -61,14 +68,31 @@ async def run_trading(mode: str, cfg: dict, storage: Storage):
     risk = RiskManager(cfg, initial_equity)
 
     sm = TradingStateMachine(cfg, rest, cache, storage, risk, reporter, mode)
-    await sm.run()
+    stop_event = asyncio.Event()
+    loop = asyncio.get_running_loop()
+
+    def _request_stop():
+        if not stop_event.is_set():
+            LOGGER.info("shutdown signal received")
+            stop_event.set()
+
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            loop.add_signal_handler(sig, _request_stop)
+        except NotImplementedError:
+            signal.signal(sig, lambda *_: _request_stop())
+
+    try:
+        await sm.run(stop_event=stop_event)
+    finally:
+        await rest.aclose()
 
 
 def run_backtest(cfg: dict, storage: Storage):
     LOGGER.info("Starting historical backtest...")
     
     data_manager = DataManager(storage)
-    from .backtest_engine import HistoricalDataLoader
+    from .backtest_engine_simple import HistoricalDataLoader
     data_loader = HistoricalDataLoader(storage)
     backtest_engine = BacktestEngine(cfg, storage, data_loader)
     
@@ -81,14 +105,36 @@ def run_backtest(cfg: dict, storage: Storage):
         "KRW-LTC", "KRW-BCH", "KRW-ETC", "KRW-SOL", "KRW-MATIC"
     ]
     
-    data_status = asyncio.run(data_manager.ensure_data_availability(
-        test_markets, start_date, end_date, fill_gaps=False
-    ))
+    data_status = asyncio.run(
+        data_manager.ensure_data_availability(test_markets, start_date, end_date, fill_gaps=True)
+    )
     
     available_markets = [m for m, available in data_status.items() if available]
+
+    if not available_markets:
+        # 상태 플래그가 False여도 DB에 실제 캔들이 있으면 백테스트에서 사용 가능
+        for market in test_markets:
+            row = storage.query_one(
+                """
+                SELECT COUNT(*) AS n
+                FROM candles
+                WHERE market = ? AND timestamp BETWEEN ? AND ?
+                """,
+                (market, start_date.timestamp(), end_date.timestamp()),
+            )
+            if row and int(row["n"]) >= 200:
+                available_markets.append(market)
+
+    if not available_markets:
+        LOGGER.warning("No available markets after gap-fill. Attempting fresh download for test markets...")
+        try:
+            collected = asyncio.run(data_manager.collector.collect_universe_data(test_markets, start_date, end_date))
+            available_markets = [m for m, ok in collected.items() if ok]
+        except Exception as e:
+            LOGGER.warning("Fresh data download attempt failed: %s", e)
     
     if not available_markets:
-        LOGGER.error("No historical data available for backtest")
+        LOGGER.error("No historical data available for backtest (markets=%s, range=%s~%s)", test_markets, start_date, end_date)
         m = run_backtest_30d(cfg)
         _store_legacy_backtest_result(cfg, storage, m)
         return
@@ -159,9 +205,13 @@ def _store_legacy_backtest_result(cfg: dict, storage: Storage, m: dict):
     LOGGER.info("Legacy simulation backtest completed: %s", m)
 
 
+def _lock_path() -> str:
+    return os.path.join(os.getcwd(), ".upbit_bot.lock")
+
+
 def _acquire_singleton_lock() -> object:
     """중복 실행 방지(특히 live 모드에서 치명적)."""
-    lock_path = os.path.join(os.getcwd(), ".upbit_bot.lock")
+    lock_path = _lock_path()
     f = open(lock_path, "a+", encoding="utf-8")
     try:
         fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -175,29 +225,79 @@ def _acquire_singleton_lock() -> object:
     f.truncate()
     f.write(str(os.getpid()))
     f.flush()
+    os.fsync(f.fileno())
     return f
+
+
+def _read_lock_pid() -> int | None:
+    try:
+        with open(_lock_path(), "r", encoding="utf-8") as f:
+            raw = (f.read() or "").strip()
+        if not raw:
+            return None
+        return int(raw)
+    except Exception:
+        return None
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+        return True
+    except Exception:
+        return False
+
+
+def run_healthcheck(cfg: dict) -> int:
+    Path("data").mkdir(exist_ok=True)
+    storage = Storage("data/trading_bot.db")
+    status = {
+        "ok": False,
+        "pid": None,
+        "pid_alive": False,
+        "db_ok": False,
+        "last_ws_tick_ms": None,
+        "last_candle_fetch_ms": None,
+    }
+    try:
+        status["db_ok"] = True
+        pid = _read_lock_pid()
+        status["pid"] = pid
+        status["pid_alive"] = bool(pid and _pid_alive(pid))
+
+        ws = storage.query_one("SELECT ts_ms FROM runtime_events WHERE event='WS_TICK_OK' ORDER BY ts_ms DESC LIMIT 1")
+        cdl = storage.query_one("SELECT ts_ms FROM runtime_events WHERE event='CANDLE_FETCH_OK' ORDER BY ts_ms DESC LIMIT 1")
+        status["last_ws_tick_ms"] = int(ws["ts_ms"]) if ws else None
+        status["last_candle_fetch_ms"] = int(cdl["ts_ms"]) if cdl else None
+
+        now_ms = int(datetime.now().timestamp() * 1000)
+        ws_fresh = bool(status["last_ws_tick_ms"] and (now_ms - status["last_ws_tick_ms"] < 180_000))
+        cdl_fresh = bool(status["last_candle_fetch_ms"] and (now_ms - status["last_candle_fetch_ms"] < 300_000))
+        status["ok"] = bool(status["db_ok"] and status["pid_alive"] and ws_fresh and cdl_fresh)
+    except Exception as e:
+        status["error"] = str(e)
+    finally:
+        storage.close()
+
+    print(json.dumps(status, ensure_ascii=True))
+    return 0 if status.get("ok") else 1
 
 
 def main():
     args = parse_args()
+    setup_logging("logs/bot.log")
     cfg = load_config(args.config)
 
-    # 중복 실행 방지 (backtest는 제외)
+    # .env에서 UPBIT_ACCESS_KEY/UPBIT_SECRET_KEY를 로드하여 live 모드에서도 자동 인식
+    load_env_file(".env", override=False)
+
+    if args.health:
+        raise SystemExit(run_healthcheck(cfg))
+
+    # 중복 실행 방지 (backtest/health는 제외)
     lock_f = None
     if args.mode != "backtest":
         lock_f = _acquire_singleton_lock()
-
-    # .env에서 UPBIT_ACCESS_KEY/UPBIT_SECRET_KEY를 로드하여 live 모드에서도 자동 인식
-    if os.path.exists(".env"):
-        LOGGER.info("Loading env file: .env")
-    else:
-        LOGGER.info("Env file not found: .env")
-    if os.path.exists(os.path.expanduser("~/.upbit_bot.env")):
-        LOGGER.info("(hint) Also supported: ~/.upbit_bot.env (loaded by scripts/run_live.sh)")
-
-    load_env_file(".env", override=False)
-
-    setup_logging("logs/bot.log")
 
     Path("data").mkdir(exist_ok=True)
     Path("reports").mkdir(exist_ok=True)
@@ -211,7 +311,13 @@ def main():
                 access_env = cfg.get("env", {}).get("upbit_access_key", "UPBIT_ACCESS_KEY")
                 secret_env = cfg.get("env", {}).get("upbit_secret_key", "UPBIT_SECRET_KEY")
                 if not env_or_none(access_env) or not env_or_none(secret_env):
-                    LOGGER.warning("live 모드이지만 API 키가 없어 모의체결로 동작합니다. env: %s, %s", access_env, secret_env)
+                    LOGGER.error("live 모드 실행 시 API 키(UPBIT_ACCESS_KEY, UPBIT_SECRET_KEY)가 반드시 필요합니다.")
+                    LOGGER.error("실제 거래를 원하시면 .env 파일에 API 키를 설정하거나 환경변수를export하세요.")
+                    raise SystemExit(1)
+                if os.getenv("UPBIT_LIVE_CONFIRM", "").strip().upper() != "YES":
+                    LOGGER.error("UPBIT_LIVE_CONFIRM=YES 가 설정되지 않아 live 주문이 차단됩니다.")
+                    LOGGER.error("실제 거래를 원하시면 UPBIT_LIVE_CONFIRM=YES 를 설정하세요.")
+                    raise SystemExit(1)
             asyncio.run(run_trading(args.mode, cfg, storage))
     except KeyboardInterrupt:
         LOGGER.info("종료 신호 수신")

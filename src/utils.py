@@ -1,7 +1,9 @@
 import logging
 import os
+import json
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -54,9 +56,19 @@ def pct_change(cur: float, prev: float) -> float:
 
 
 def setup_logging(log_file: str) -> None:
-    from logging.handlers import RotatingFileHandler
-
     Path(log_file).parent.mkdir(parents=True, exist_ok=True)
+
+    class JsonLogFormatter(logging.Formatter):
+        def format(self, record: logging.LogRecord) -> str:
+            payload = {
+                "ts": datetime.now(tz=ZoneInfo("UTC")).isoformat(),
+                "level": record.levelname,
+                "logger": record.name,
+                "msg": record.getMessage(),
+            }
+            if record.exc_info:
+                payload["exc"] = self.formatException(record.exc_info)
+            return json.dumps(payload, ensure_ascii=True)
 
     file_handler = RotatingFileHandler(
         log_file,
@@ -64,12 +76,14 @@ def setup_logging(log_file: str) -> None:
         backupCount=10,
         encoding="utf-8",
     )
+    file_handler.setFormatter(JsonLogFormatter())
     stream_handler = logging.StreamHandler()
+    stream_handler.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(name)s | %(message)s"))
 
     logging.basicConfig(
         level=logging.INFO,
-        format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
         handlers=[file_handler, stream_handler],
+        force=True,
     )
 
 

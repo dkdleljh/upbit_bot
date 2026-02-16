@@ -132,12 +132,12 @@ class HistoricalDataCollector:
         """Collect a chunk of candle data with semaphore control."""
         async with semaphore:
             try:
-                # Convert to timestamps
-                start_ts = int(start_date.timestamp() * 1000)
-                end_ts = int(end_date.timestamp() * 1000)
-                
-                # Build API URL
-                url = f"{self.base_url}?market={market}&to={end_ts}&count=200"
+                start_ts = float(start_date.timestamp())
+                end_ts = float(end_date.timestamp())
+
+                # Upbit `to` 파라미터는 시각 문자열 기준.
+                to_str = end_date.strftime("%Y-%m-%d %H:%M:%S")
+                url = f"{self.base_url}?market={market}&to={to_str}&count=200"
                 
                 # Make request
                 async with aiohttp.ClientSession() as session:
@@ -148,12 +148,13 @@ class HistoricalDataCollector:
                             # Filter by start date and format
                             formatted_candles = []
                             for candle in candles:
-                                candle_time = datetime.fromisoformat(candle["candle_date_time_kst"].replace('Z', '+00:00'))
-                                
-                                if candle_time >= start_date:
+                                candle_ts = float(candle.get("timestamp", 0.0)) / 1000.0
+                                if candle_ts <= 0:
+                                    continue
+                                if start_ts <= candle_ts <= end_ts:
                                     formatted_candles.append({
                                         'market': market,
-                                        'timestamp': candle_time.timestamp(),
+                                        'timestamp': candle_ts,
                                         'open': float(candle['opening_price']),
                                         'high': float(candle['high_price']),
                                         'low': float(candle['low_price']),

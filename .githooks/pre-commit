@@ -1,0 +1,46 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Pre-commit hook for upbit_bot
+# - Runs fast safety checks (secrets / ignored files)
+# - Runs project smoke checks (tests + health)
+
+ROOT_DIR="$(git rev-parse --show-toplevel)"
+cd "$ROOT_DIR"
+
+echo "[pre-commit] secret/ignore checks"
+
+# 1) Ensure .env is not staged (it should be ignored)
+if git diff --cached --name-only | grep -qE '(^|/)\.env$'; then
+  echo "[pre-commit] ERROR: .env is staged. Remove it from staging (git restore --staged .env)" >&2
+  exit 1
+fi
+
+# 2) Block obvious secret patterns in staged *files*
+# Allowlist some files that intentionally contain placeholder examples.
+# (best-effort: avoids accidental commits; not a full secret scanner)
+SECRET_RE='(UPBIT_ACCESS_KEY\s*=|UPBIT_SECRET_KEY\s*=|TELEGRAM_BOT_TOKEN\s*=|TELEGRAM_CHAT_ID\s*=|BEGIN (RSA |EC )?PRIVATE KEY|aws_access_key_id|aws_secret_access_key)'
+ALLOW_EXAMPLE_RE='(^|/)(\.env\.example|README\.md|사용설명서_업비트봇_MVP\.md|\.githooks/pre-commit)$'
+
+while IFS= read -r f; do
+  if echo "$f" | grep -qE "$ALLOW_EXAMPLE_RE"; then
+    continue
+  fi
+  # Check the staged version of the file (if it exists in index)
+  if git show ":$f" 2>/dev/null | grep -nE "$SECRET_RE" >/dev/null; then
+    echo "[pre-commit] ERROR: secrets-like pattern found in staged file: $f" >&2
+    echo "[pre-commit] Hint: remove secrets, or move them to .env (ignored)." >&2
+    exit 1
+  fi
+done < <(git diff --cached --name-only)
+
+
+# 3) Ensure ignored runtime files are not staged (allow deleting previously-tracked ones)
+if git diff --cached --name-status | awk '$1 != "D" {print $2}' | grep -qE '(^|/)\.upbit_live_pid$|(^|/)\.upbit_bot\.lock$|^reports/'; then
+  echo "[pre-commit] ERROR: runtime/output files are staged (.upbit_live_pid/.upbit_bot.lock/reports)." >&2
+  echo "[pre-commit] (deletions are allowed; additions/modifications are blocked)" >&2
+  exit 1
+fi
+
+echo "[pre-commit] running scripts/smoke_check.sh"
+exec bash scripts/smoke_check.sh

@@ -1,5 +1,4 @@
 from dataclasses import dataclass
-
 from .utils import now_ms, parse_market
 
 
@@ -14,10 +13,12 @@ class Position:
     entry_ts_ms: int
     score: float
     tp1_done: bool = False
-    adds: int = 0  # 피라미딩(불타기) 횟수
-    # 봇 외부(수동/기존보유)에서 유입된 포지션인지 표시
+    tp2_done: bool = False
+    adds: int = 0
     restored: bool = False
     restored_ts_ms: int = 0
+    trailing_activated: bool = False
+    volatility_regime: str = "normal"
 
 
 class Portfolio:
@@ -73,6 +74,7 @@ class Portfolio:
         *,
         entry_ts_ms: int | None = None,
         restored: bool = False,
+        volatility_regime: str = "normal",
     ) -> None:
         base = parse_market(market).base
         ts = entry_ts_ms if entry_ts_ms is not None else now_ms()
@@ -88,6 +90,7 @@ class Portfolio:
             adds=0,
             restored=restored,
             restored_ts_ms=ts if restored else 0,
+            volatility_regime=volatility_regime,
         )
 
     def remove(self, market: str) -> Position | None:
@@ -101,12 +104,10 @@ class Portfolio:
 
     def net_pnl_pct(self, p: Position, last_price: float, fee_rate: float, slip_exit: float) -> float:
         gross = (last_price - p.entry_price) / p.entry_price
-        # 왕복 수수료(진입+청산) 반영
         fee_total = fee_rate * 2
-        # 슬리피지 추정치 반영
         return gross - fee_total - slip_exit
 
-    def evaluate_exits(self, market: str, last_price: float, fee_rate: float, slip_exit: float) -> list[dict]:
+    def evaluate_exits(self, market: str, last_price: float, fee_rate: float, slip_exit: float, atr_pct: float = 0.0, volatility_regime: str = "normal") -> list[dict]:
         out: list[dict] = []
         p = self.positions.get(market)
         if not p:
@@ -116,29 +117,47 @@ class Portfolio:
         hold_sec = (now_ms() - p.entry_ts_ms) // 1000
         pnl = self.net_pnl_pct(p, last_price, fee_rate, slip_exit)
 
-        # Breakeven Stop: 순수익률(수수료 차감 후) 1.2% 도달 시 손절가를 본전(진입가 + 왕복수수료)으로 상향
-        # 즉, 떨어져도 수수료는 건지고 나오겠다는 전략
+        tp_multiplier = 1.0
+        trailing_multiplier = 1.0
+        if volatility_regime == 'high':
+            tp_multiplier = 1.3
+            trailing_multiplier = 1.2
+        elif volatility_regime == 'low':
+            tp_multiplier = 0.8
+            trailing_multiplier = 0.9
+
+        base_tp = self.cfg["stops"]["tp_net_pnl_pct"]
+        adjusted_tp = base_tp * tp_multiplier
+        
+        base_trailing = self.cfg["stops"]["trailing_stop_pct"]
+        adjusted_trailing = base_trailing * trailing_multiplier
+
         breakeven_trigger = 0.012
         if pnl >= breakeven_trigger:
-            # 최소한 수수료(0.1%)와 슬리피지(0.1%)를 커버할 수 있는 가격을 새로운 스탑으로 설정
             safe_margin = fee_rate * 2 + 0.001 
             new_stop = p.entry_price * (1 + safe_margin)
             
             if p.stop_price < new_stop:
                 p.stop_price = new_stop
 
-        # 피라미딩한 포지션은 스탑로스가 진입가보다 높을 수 있음 -> 가격이 스탑 밑으로 가면 무조건 청산
         if last_price <= p.stop_price:
             out.append({"type": "STOP", "ratio": 1.0, "reason": "hard_stop"})
             return out
 
-        if pnl >= self.cfg["stops"]["tp_net_pnl_pct"] and not p.tp1_done:
+        if pnl >= adjusted_tp and not p.tp1_done:
             out.append({"type": "TP1", "ratio": self.cfg["stops"]["tp1_ratio"], "reason": "tp1"})
             p.tp1_done = True
+            p.trailing_activated = True
+
+        tp2_threshold = adjusted_tp * 2
+        if p.tp1_done and pnl >= tp2_threshold and not p.tp2_done:
+            tp2_ratio = self.cfg["stops"].get("tp2_ratio", 0.3)
+            out.append({"type": "TP2", "ratio": tp2_ratio, "reason": "tp2"})
+            p.tp2_done = True
 
         if p.tp1_done:
             dd = (p.peak_price - last_price) / max(1e-9, p.peak_price)
-            if dd >= self.cfg["stops"]["trailing_stop_pct"]:
+            if dd >= adjusted_trailing:
                 out.append({"type": "TRAIL", "ratio": 1.0, "reason": "trailing"})
                 return out
 

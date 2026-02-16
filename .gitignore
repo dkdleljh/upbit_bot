@@ -65,3 +65,10 @@ Thumbs.db
 # 임시 파일
 *.tmp
 *.temp
+
+# 런타임 생성 파일(커밋 금지)
+.upbit_bot.lock
+.upbit_live_pid
+
+# 리포트/산출물(커밋 금지)
+reports/

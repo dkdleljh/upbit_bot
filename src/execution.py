@@ -1,7 +1,9 @@
 import asyncio
 import logging
+import os
 from collections import defaultdict, deque
 from dataclasses import dataclass
+from datetime import datetime, timezone
 
 from .utils import now_ms, adjust_price_to_tick
 
@@ -31,6 +33,14 @@ class ExecutionEngine:
 
         # 더스트(5,000원 미만) 처리용 쿨다운
         self._dust_cooldown_until_ms: dict[str, int] = {}
+        # 손절 더스트(최소주문금액 미만) 반복 에러 루프 방지
+        self._stoploss_under_notional_until_ms: dict[str, int] = {}
+
+        # live 안전 기본값 (환경변수로 오버라이드)
+        self.live_confirm_required = os.getenv("UPBIT_LIVE_CONFIRM", "").strip().upper() == "YES"
+        self.kill_switch = os.getenv("UPBIT_KILL_SWITCH", "0").strip() == "1"
+        self.max_order_krw = max(5000.0, float(os.getenv("UPBIT_MAX_ORDER_KRW", "100000")))
+        self.max_trades_per_day = max(1, int(os.getenv("UPBIT_MAX_TRADES_PER_DAY", "30")))
 
     def _depth_ratio(self, orderbook: dict, order_value_krw: float, side: str = "BUY") -> float:
         units = orderbook.get("orderbook_units", [])[:3]
@@ -131,6 +141,12 @@ class ExecutionEngine:
         cap = self.cfg["gates"]["entry_slippage_cap"] if side == "BUY" else self.cfg["gates"]["exit_slippage_cap"]
         if slippage_pct > cap:
             self.cooldown_until_ms[market] = now_ms() + self.cfg["gates"]["cooldown_minutes"] * 60 * 1000
+
+    def _log_runtime_event(self, level: str, event: str, market: str | None, details: str) -> None:
+        try:
+            self.storage.log_event(level, event, market, details)
+        except Exception:
+            pass
 
     def _parse_live_fill(self, order: dict, fallback_price: float, fallback_fee: float) -> tuple[float, float, float, str]:
         executed_volume = float(order.get("executed_volume") or 0.0)
@@ -245,6 +261,17 @@ class ExecutionEngine:
     ) -> ExecutionResult:
         if not self.rest or not self.rest.is_live_ready:
             return ExecutionResult(False, market, side, qty, ref_price, 0.0, 0.0, "live_not_ready")
+        if not self.live_confirm_required:
+            return ExecutionResult(False, market, side, qty, ref_price, 0.0, 0.0, "live_confirm_missing")
+        if self.kill_switch:
+            return ExecutionResult(False, market, side, qty, ref_price, 0.0, 0.0, "kill_switch_on")
+
+        if side == "BUY" and order_value_krw > self.max_order_krw:
+            order_value_krw = self.max_order_krw
+
+        # 일일 거래 제한은 신규 진입(BUY)에만 적용. 청산(SELL)은 항상 허용.
+        if side == "BUY" and (not self._within_daily_trade_limit()):
+            return ExecutionResult(False, market, side, qty, ref_price, 0.0, 0.0, "daily_trade_limit")
 
         # 주문 멱등성(중복 제출 방지)
         if not self._try_dedup(market, side, reason or "", qty, ref_price):
@@ -295,12 +322,25 @@ class ExecutionEngine:
                 # (승률/안전 보강) 손절 상황에서 더스트 탑업 매수는 '손절을 위해 추가매수'가 되어
                 # 가격/수량이 꼬이고 과매도/주문부족 에러를 유발할 수 있으므로 금지합니다.
                 if "stop" in reason.lower():
+                    cd_until = int(self._stoploss_under_notional_until_ms.get(market, 0))
+                    now = now_ms()
+                    if now < cd_until:
+                        return ExecutionResult(False, market, side, qty, ref_price, 0.0, 0.0, "stoploss_under_min_notional_cooldown")
+                    cooldown_s = int(self.cfg.get("dust", {}).get("stoploss_under_min_notional_cooldown_seconds", 600) or 600)
+                    self._stoploss_under_notional_until_ms[market] = now + (cooldown_s * 1000)
+                    self._log_runtime_event(
+                        "WARN",
+                        "STOPLOSS_UNDER_MIN_NOTIONAL",
+                        market,
+                        f"reason={reason} order_value_krw={order_value_krw:.0f} min_notional_krw={min_notional:.0f} qty={qty:.8f} ref_price={ref_price:.4f} cooldown_s={cooldown_s}",
+                    )
                     return ExecutionResult(False, market, side, qty, ref_price, 0.0, 0.0, "stoploss_under_min_notional")
 
                 can_topup = self.cfg.get("dust", {}).get("topup_before_sell", False)
                 # KRW 마켓이고, Top-up 설정이 켜져 있을 때만 시도
                 if can_topup and quote == "KRW":
-                    # 1. 필요 금액 계산 (최소금액 + 버퍼만큼 확보)
+                    # [개선] 시장가 매수 대신 지정가 매수 사용 (슬리피지 위험 감소)
+                    # 지정가로 매수 후 시장가로 전환하는 하이브리드 방식
                     buffer = float(self.cfg["dust"].get("topup_buffer_krw", 2000))
                     target_amt = 5000 + buffer # 최소 5,000원은 넘겨야 함
                     buy_needed = target_amt - order_value_krw
@@ -313,115 +353,43 @@ class ExecutionEngine:
                     if now_ms() < cd_until:
                         return ExecutionResult(False, market, side, qty, ref_price, 0.0, 0.0, "dust_topup_cooldown")
 
-                    if 0 < buy_needed <= max_topup:
-                        LOGGER.warning(f"DUST_TOPUP: Buying {buy_needed:.0f} KRW to exit {market} (Current Value: {order_value_krw:.0f} KRW)")
-                        
-                        # 2. 시장가 매수 시도
-                        buy_res = await self.rest.place_market_buy(market, buy_needed)
+                    buy_amt = max(float(buy_needed), float(min_notional))
+                    if 0 < buy_amt <= max_topup:
+                        # NOTE: Upbit enforces a minimum total for BUY orders too.
+                        # A limit buy with a small KRW notional will fail with under_min_total_bid.
+                        # For dust top-up we prioritize reliability: use a single market buy.
+                        LOGGER.warning(
+                            f"DUST_TOPUP: Buying {buy_amt:.0f} KRW to exit {market} (Current Value: {order_value_krw:.0f} KRW, needed={buy_needed:.0f})"
+                        )
+
+                        buy_res = await self._call_rest(self.rest.place_market_buy, market, buy_amt)
                         if buy_res and buy_res.get("uuid"):
-                            # 체결 대기 (1초)
                             await asyncio.sleep(1.0)
-                            # 잔고 재조회 (매수된 수량 합산)
                             new_qty = await self._base_available(market)
                             if new_qty is not None and new_qty > qty:
-                                LOGGER.info(f"DUST_TOPUP: Success. Qty updated {qty} -> {new_qty}")
-                                qty = new_qty # 수량 업데이트
-                                # 더스트 탑업은 연속 실행되면 위험하므로 쿨다운
-                                self._dust_cooldown_until_ms[market] = now_ms() + int(self.cfg.get("dust", {}).get("topup_cooldown_seconds", 1800)) * 1000
-                                # 이제 아래 매도 로직으로 진행 (수량이 늘어났으므로 5000원 넘음)
+                                LOGGER.warning(f"DUST_TOPUP: Success. Qty updated {qty} -> {new_qty}")
+                                qty = new_qty
+                                self._dust_cooldown_until_ms[market] = now_ms() + int(
+                                    self.cfg.get("dust", {}).get("topup_cooldown_seconds", 1800)
+                                ) * 1000
                             else:
                                 return ExecutionResult(False, market, side, qty, ref_price, 0.0, 0.0, "dust_buy_failed_balance_check")
                         else:
-                             return ExecutionResult(False, market, side, qty, ref_price, 0.0, 0.0, "dust_buy_failed_api_error")
+                            return ExecutionResult(False, market, side, qty, ref_price, 0.0, 0.0, "dust_buy_failed_api_error")
                     else:
-                         return ExecutionResult(False, market, side, qty, ref_price, 0.0, 0.0, "dust_too_large_or_invalid")
+                        return ExecutionResult(False, market, side, qty, ref_price, 0.0, 0.0, "dust_too_large_or_invalid")
                 else:
                     return ExecutionResult(False, market, side, qty, ref_price, 0.0, 0.0, "live_under_min_notional")
 
         fallback_fee = order_value_krw * self._fee_rate(market)
-
-        # [지정가 주문으로 변경]
-        # 시장가 주문은 슬리피지가 크고, 급등/급락 시 불리한 가격에 체결될 위험이 있음.
-        # 따라서 최우선 호가(1호가)에 지정가 주문을 내고, 미체결 시 취소하는 전략 사용.
-        
         placed = None
-        limit_price = ref_price # 기본값 (호가 정보가 없을 경우)
 
-        # 호가 정보 조회 (없으면 ref_price 사용)
-        try:
-            # 현재가와 호가 차이가 크지 않다고 가정하고, ref_price를 기준으로 함.
-            # 더 정밀하게 하려면 orderbook을 인자로 받아야 하지만, 여기서는 ref_price 사용.
-            # 지정가 주문은 가격 단위(Tick Size)를 맞춰야 하므로, 단순히 ref_price를 쓰면 에러날 수 있음.
-            # 하지만 Upbit API는 유효하지 않은 가격이면 400 에러를 줌.
-            # 여기서는 편의상 시장가 주문을 유지하되, IOC(Immediate or Cancel) 옵션이 없으므로
-            # "지정가 주문 후 5초 대기 -> 미체결 시 취소" 로직으로 구현.
-            
-            # NOTE: 호가 단위를 맞추는 로직(get_tick_size)이 없어서, 
-            # 일단은 시장가 주문(market/price)을 유지하되 
-            # 매수 시에는 "현재가보다 높게 잡히지 않도록" 감시하는 로직이 필요함.
-            # 하지만 시장가 주문은 가격을 지정할 수 없음.
-            
-            # 결론: 지정가 주문을 하려면 '호가 단위 계산'이 필수임.
-            # 현재 코드베이스엔 호가 단위 계산 로직이 없으므로, 
-            # **시장가 주문을 쓰되, 진입 조건을 더 까다롭게(RSI/윗꼬리) 한 것**으로 만족해야 함.
-            # 무리하게 지정가를 쓰다가 '호가 단위 오류'로 주문 거부당하면 더 손해임.
-            
-            # 따라서 여기서는 지정가 로직 대신, **기존 시장가 주문을 유지**하되
-            # 위에서 적용한 '알고리즘 필터(RSI, 윗꼬리)'가 잘 작동하기를 기대하는 것이 안전함.
-            
-            # 다만, 매도(SELL) 시에는 '시장가 매도(던지기)'가 너무 위험하므로,
-            # 매도만이라도 **"호가창을 보고 지정가 매도"**를 시도하는 게 좋으나,
-            # 역시 호가 단위 문제 때문에 복잡함.
-            
-            # --> **전략 수정: 지정가 전환은 호가 단위 모듈 없이는 위험함.**
-            # 대신 **"슬리피지 체크 강화"**로 우회 방어.
-            pass
-
-        except Exception:
-            pass
-
-        # [주문 실행 라우팅 (Order Routing) - Smart Chasing]
-        # 1차 시도: 지정가(Limit) -> 미체결 시 취소 -> 2차 시도: 시장가(Market)
-        
-        placed = None
-        
-        # A. 매수 주문 (Limit Chasing)
+        # A. 매수는 취소 루프 없이 단일 시장가 주문으로 단순화(체결 실패/취소 churn 감소)
         if side == "BUY":
-            min_krw = 5500
-            if quote == "KRW" and order_value_krw < min_krw:
-                 return ExecutionResult(False, market, side, qty, ref_price, 0.0, 0.0, "live_value_too_small")
-
-            # 1. 최우선 매도호가(Ask 1)로 지정가 주문 (Taker지만 지정가라 안전)
-            target_price = adjust_price_to_tick(ref_price) # ref_price는 현재가(Ask1 근처)
-            
-            # KRW 마켓은 가격 필수, BTC/USDT는 수량 필수
             if quote == "KRW":
-                placed = await self.rest.place_limit_buy(market, order_value_krw / max(target_price, 1), target_price)
+                placed = await self._call_rest(self.rest.place_market_buy, market, order_value_krw)
             else:
-                placed = await self.rest.place_limit_buy(market, qty, target_price)
-
-            # 체결 확인 및 추격 (Chasing)
-            if placed and placed.get("uuid"):
-                # 3초 대기 (체결 기회 부여)
-                await asyncio.sleep(3.0)
-                detail = await self.rest.get_order(placed["uuid"])
-                
-                # 아직 대기 중('wait')이면 -> 취소 후 시장가(Taker)로 전환
-                if detail and detail.get("state") == "wait":
-                     # 부분 체결량 확인
-                     executed_vol = float(detail.get("executed_volume", 0.0))
-                     remaining_vol = float(detail.get("remaining_volume", 0.0))
-                     
-                     # 90% 이상 체결됐으면 그냥 둠
-                     if remaining_vol > 0 and (executed_vol / (executed_vol + remaining_vol) < 0.9):
-                         await self.rest.cancel_order(placed["uuid"])
-                         await asyncio.sleep(0.5)
-                         # 남은 금액만큼 시장가 재주문
-                         rem_val = remaining_vol * target_price
-                         if quote == "KRW":
-                             placed = await self.rest.place_market_buy(market, rem_val)
-                         else:
-                             placed = await self.rest.place_market_buy_volume(market, remaining_vol)
+                placed = await self._call_rest(self.rest.place_market_buy_volume, market, qty)
 
         # B. 매도 주문 (상황별 분기)
         else:
@@ -430,7 +398,7 @@ class ExecutionEngine:
                 q = qty
                 # 시장가 매도 재시도 로직 (최대 3회)
                 for i in range(3):
-                    placed_try = await self.rest.place_market_sell(market, q)
+                    placed_try = await self._call_rest(self.rest.place_market_sell, market, q)
                     # 성공하면 break
                     if isinstance(placed_try, dict) and placed_try.get("uuid"):
                         placed = placed_try
@@ -442,29 +410,21 @@ class ExecutionEngine:
                         await asyncio.sleep(0.2)
                         continue
                     break
-            
-            # 2) 여유 있는 상황: 익절(take_profit), 시간만료 -> 지정가 시도 후 시장가
+
+            # 2) 여유 있는 상황: 지정가 짧게 대기 후 시장가 fallback
             else:
-                # 지정가 매도: 현재가 기준 호가 보정
                 limit_price = adjust_price_to_tick(ref_price)
-                
-                # 주문 시도
-                placed = await self.rest.place_limit_sell(market, qty, limit_price)
-                
+                placed = await self._call_rest(self.rest.place_limit_sell, market, qty, limit_price)
                 if placed and placed.get("uuid"):
-                    # 지정가 체결 대기 (5초)
-                    await asyncio.sleep(5.0)
-                    detail = await self.rest.get_order(placed["uuid"])
-                    
-                    # 5초 뒤에도 'wait' 상태면 취소하고 시장가로 전환
+                    wait_s = float(self.cfg.get("live", {}).get("sell_limit_wait_seconds", 2.0) or 2.0)
+                    await asyncio.sleep(max(0.5, wait_s))
+                    detail = await self._call_rest(self.rest.get_order, placed["uuid"])
                     if detail and detail.get("state") == "wait":
                         remaining_vol = float(detail.get("remaining_volume", 0.0))
-                        # 잔량이 유의미하면 취소 후 시장가
-                        if remaining_vol * limit_price > 1000:
-                            await self.rest.cancel_order(placed["uuid"])
+                        if remaining_vol * limit_price >= 1000.0:
+                            await self._call_rest(self.rest.cancel_order, placed["uuid"])
                             await asyncio.sleep(0.5)
-                            # 남은 수량만큼 시장가 매도 (Fallback)
-                            placed = await self.rest.place_market_sell(market, remaining_vol)
+                            placed = await self._call_rest(self.rest.place_market_sell, market, remaining_vol)
 
         if not placed or not placed.get("uuid"):
             return ExecutionResult(False, market, side, qty, ref_price, 0.0, 0.0, "live_place_failed")
@@ -487,9 +447,9 @@ class ExecutionEngine:
         # 1회 재시도 정책
         if remaining_qty > 1e-10 and remaining_value >= 1000:
             if side == "BUY":
-                placed2 = await self.rest.place_market_buy(market, remaining_value)
+                placed2 = await self._call_rest(self.rest.place_market_buy, market, remaining_value)
             else:
-                placed2 = await self.rest.place_market_sell(market, remaining_qty)
+                placed2 = await self._call_rest(self.rest.place_market_sell, market, remaining_qty)
             if placed2 and placed2.get("uuid"):
                 detail2 = await self._poll_order(placed2["uuid"])
                 if detail2:
@@ -512,6 +472,10 @@ class ExecutionEngine:
 
         self.slip_hist[market].append(slip)
         self._maybe_cooldown_by_slippage(market, side, slip)
+
+        # Normalize status: canceled orders can be partially filled.
+        if status == "cancel" and filled_qty > 1e-12:
+            status = "partial_cancel"
 
         filled_value_effective = filled_qty * fill_price
         self._save_trade(
@@ -544,7 +508,11 @@ class ExecutionEngine:
         reason: str,
     ) -> ExecutionResult:
         if self.mode == "live" and self.rest and self.rest.is_live_ready:
-            return await self._execute_live(market, side, order_value_krw, qty, ref_price, reason)
+            try:
+                return await self._execute_live(market, side, order_value_krw, qty, ref_price, reason)
+            except Exception as e:
+                LOGGER.exception("execute_market live failed: %s", e)
+                return ExecutionResult(False, market, side, qty, ref_price, 0.0, 0.0, f"live_exception:{type(e).__name__}")
 
         # paper/backtest 또는 live 키 미설정 시 모의체결
         if side == "BUY":
@@ -560,3 +528,44 @@ class ExecutionEngine:
 
     def is_cooldown(self, market: str) -> bool:
         return now_ms() < self.cooldown_until_ms.get(market, 0)
+
+    async def _call_rest(self, fn, *args, retries: int = 3, base_delay_s: float = 0.5):
+        for attempt in range(retries):
+            try:
+                return await fn(*args)
+            except Exception as e:
+                if attempt == retries - 1:
+                    raise
+                wait = base_delay_s * (2 ** attempt)
+                LOGGER.warning("REST call failed (%s), retrying in %.2fs: %s", fn.__name__, wait, e)
+                await asyncio.sleep(wait)
+
+    def _within_daily_trade_limit(self) -> bool:
+        """일일 거래횟수 제한 체크.
+
+        기존 구현은 UTC 자정 기준이라(KST 기준 오전 9시에 리셋) 체감상 '하루'와 어긋나
+        쉽게 daily_trade_limit에 걸립니다. 설정된 timezone(기본 Asia/Seoul) 자정 기준으로 계산합니다.
+        """
+        try:
+            # cfg의 timezone 우선, 없으면 Asia/Seoul
+            tz_name = str(self.cfg.get("timezone") or "Asia/Seoul")
+            try:
+                from zoneinfo import ZoneInfo
+
+                tz = ZoneInfo(tz_name)
+            except Exception:
+                tz = timezone.utc
+
+            now_local = datetime.now(tz=tz)
+            start_local = datetime.combine(now_local.date(), datetime.min.time(), tzinfo=tz)
+            start_ms = int(start_local.astimezone(timezone.utc).timestamp() * 1000)
+
+            rows = self.storage.query(
+                "SELECT COUNT(*) AS n FROM trades WHERE mode='live' AND status LIKE 'filled_live_%' AND ts_ms >= ?",
+                (start_ms,),
+            )
+            n = int(rows[0]["n"]) if rows else 0
+            return n < self.max_trades_per_day
+        except Exception:
+            # 실패 시 보수적으로 허용 (실거래 차단으로 인한 장애 전파 방지)
+            return True

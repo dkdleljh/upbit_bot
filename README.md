@@ -31,7 +31,7 @@
 
 현재 폴더 위치(이 프로젝트는 아래 경로를 기준으로 작성됨):
 ```bash
-/home/zenith/Desktop/upbit_bot
+/home/(사용자명)/Desktop/upbit_bot
 ```
 
 ---
@@ -40,7 +40,7 @@
 
 ### 2-1. 폴더로 이동
 ```bash
-cd /home/zenith/Desktop/upbit_bot
+cd /home/(사용자명)/Desktop/upbit_bot
 ```
 
 ### 2-2. 가상환경 생성/활성화
@@ -61,7 +61,7 @@ pip install aiohttp pyyaml numpy pandas pytest
 
 ### 3-1. 템플릿 복사해서 `.env` 만들기
 ```bash
-cd /home/zenith/Desktop/upbit_bot
+cd /home/(사용자명)/Desktop/upbit_bot
 cp .env.example .env
 ```
 
@@ -89,28 +89,28 @@ git status
 
 ### 4-1. paper 모드(처음 실행은 이걸로)
 ```bash
-cd /home/zenith/Desktop/upbit_bot
+cd /home/(사용자명)/Desktop/upbit_bot
 source .venv/bin/activate
 python -m src.main --mode paper
 ```
 
 ### 4-2. backtest 모드
 ```bash
-cd /home/zenith/Desktop/upbit_bot
+cd /home/(사용자명)/Desktop/upbit_bot
 source .venv/bin/activate
 python -m src.main --mode backtest
 ```
 
 ### 4-3. health 체크(프로세스/DB/WS 상태 확인)
 ```bash
-cd /home/zenith/Desktop/upbit_bot
+cd /home/(사용자명)/Desktop/upbit_bot
 source .venv/bin/activate
 python -m src.main --health
 ```
 
 ### 4-4. live 모드(실거래: 매우 주의)
 ```bash
-cd /home/zenith/Desktop/upbit_bot
+cd /home/(사용자명)/Desktop/upbit_bot
 source .venv/bin/activate
 python -m src.main --mode live
 ```
@@ -145,9 +145,9 @@ python -m src.main --mode live
 
 ### 7-1. 전체 테스트
 ```bash
-cd /home/zenith/Desktop/upbit_bot
+cd /home/(사용자명)/Desktop/upbit_bot
 source .venv/bin/activate
-PYTHONPATH=/home/zenith/Desktop/upbit_bot pytest tests/ -v
+PYTHONPATH=/home/(사용자명)/Desktop/upbit_bot pytest tests/ -v
 ```
 
 ---
@@ -158,7 +158,7 @@ PYTHONPATH=/home/zenith/Desktop/upbit_bot pytest tests/ -v
 
 ### 8-1. 설정(1회)
 ```bash
-cd /home/zenith/Desktop/upbit_bot
+cd /home/(사용자명)/Desktop/upbit_bot
 git config core.hooksPath .githooks
 ```
 

@@ -11,8 +11,11 @@ data/*.db-shm
 data/*.db-wal
 
 # 로그
+logs/
 logs/*.log
 logs/*.log.*
+logs/*.json
+
 
 # 보고서
 reports/*.csv

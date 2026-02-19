@@ -27,8 +27,9 @@ fi
 # If there are changes (e.g., docs/autogen), commit and push
 if [ -n "$(git status --porcelain)" ]; then
   git add -A
-  git commit -m "chore(auto): sync" || true
+  git commit -m "chore(auto): sync $(date +%F)" || true
   git push || true
+  echo "OK: $ROOT_DIR pushed" >&2
 else
   echo "[auto_sync] clean" >&2
 fi

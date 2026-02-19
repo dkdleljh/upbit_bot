@@ -65,6 +65,71 @@ regime:
   position_size_high_vol: 0.6
   position_size_low_vol: 1.2
 
+  # Regime-aware signal routing (Pro Trader Enhancement)
+  # Different market regimes require different trading strategies
+  regime_configs:
+    strong_trend:
+      # Trend-following mode: requires strong EMA alignment + high ADX
+      min_adx: 25
+      ema_weight: 40          # Higher weight for EMA in strong trend
+      volume_weight: 20
+      momentum_weight: 15
+      breakout_weight: 15
+      cutoff_bonus: 5          # More lenient cutoff in strong trend
+    weak_trend:
+      # Range/sideways mode: require tighter stops, focus on mean reversion
+      min_adx: 15
+      ema_weight: 20
+      volume_weight: 25
+      momentum_weight: 20
+      breakout_weight: 25
+      cutoff_bonus: -5         # Stricter cutoff in weak trend
+    high_volatility:
+      # High volatility mode: reduce position size, wider stops
+      min_adx: 20
+      ema_weight: 25
+      volume_weight: 30       # Higher volume confirmation needed
+      momentum_weight: 15
+      breakout_weight: 20
+      cutoff_bonus: 0
+    low_volatility:
+      # Low volatility mode: can be more aggressive
+      min_adx: 15
+      ema_weight: 30
+      volume_weight: 15
+      momentum_weight: 20
+      breakout_weight: 25
+      cutoff_bonus: 10
+
+# Position sizing improvements (Pro Trader Enhancement)
+position_sizing:
+  # Fractional Kelly: reduces overbetting while maintaining edge
+  kelly_fraction: 0.25         # 0.25x Kelly = quarter Kelly (conservative)
+  # Loss streak throttle: reduce size after consecutive losses
+  loss_streak_threshold: 3    # After 3 consecutive losses
+  loss_streak_reduction: 0.5  # Reduce position by 50% during streak
+  # Minimum trades before full Kelly applies
+  min_trades_for_full_kelly: 50
+
+# Execution improvements (Pro Trader Enhancement)
+execution:
+  # Maker-first execution: try limit orders before market orders
+  use_maker_first: true
+  limit_order_timeout_seconds: 3.0
+  # Only use limit orders when spread is tight enough
+  max_spread_for_limit: 0.0015
+  # Adjust timeout based on volatility
+  volatility_adaptive_timeout: true
+
+# MTM (Mark-to-Market) risk control (Pro Trader Enhancement)
+mtm_risk:
+  # Track unrealized PnL in drawdown calculation
+  use_mtm_drawdown: true
+  # MTM drawdown threshold to pause entries
+  mtm_drawdown_pause_pct: -0.08  # 8% unrealized loss
+  # MTM drawdown threshold for full stop
+  mtm_drawdown_stop_pct: -0.12   # 12% unrealized loss
+
 time_rules:
   min_hold_seconds: 60
   soft_cut_minutes: 20
@@ -151,3 +216,35 @@ live:
   order_dedup_stop_seconds: 2
   # 일반 SELL(익절/시간청산) 지정가 대기 시간(초). 초과 시 시장가 fallback
   sell_limit_wait_seconds: 2.0
+
+walk_forward:
+  # In-sample period for parameter optimization (days)
+  in_sample_days: 30
+  # Out-of-sample period for validation (days)
+  out_of_sample_days: 7
+  # Step size to move forward each iteration (days)
+  step_days: 7
+  # Minimum trades required in OOS to consider valid
+  min_oos_trades: 5
+  # Maximum iterations for random search optimization
+  max_iterations: 50
+  # Number of parallel jobs (for future use)
+  n_jobs: 4
+
+notifications:
+  # Enable/disable all notifications
+  enabled: true
+  # Minimum priority level to notify (debug, info, warning, error, critical)
+  min_priority: warning
+  # Notify on trade execution
+  notify_on_trade: true
+  # Notify on stop loss
+  notify_on_stoploss: true
+  # Notify on errors
+  notify_on_error: true
+  # Notify on safe mode activation
+  notify_on_safe_mode: true
+  # Notify on circuit breaker activation
+  notify_on_circuit_breaker: true
+  # Notify daily summary
+  notify_on_daily_summary: true

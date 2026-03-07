@@ -3,6 +3,7 @@ set -euo pipefail
 cd /home/zenith/Desktop/upbit_bot
 [ -f /home/zenith/.upbit_bot.env ] && . /home/zenith/.upbit_bot.env
 export UPBIT_LIVE_CONFIRM="${UPBIT_LIVE_CONFIRM:-NO}"
+export UPBIT_KILL_SWITCH="${UPBIT_KILL_SWITCH:-1}"
 PY=python3
 if [ -x .venv/bin/python ]; then
   if .venv/bin/python - <<'PYCHK' >/dev/null 2>&1

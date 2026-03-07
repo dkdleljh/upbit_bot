@@ -19,8 +19,89 @@ def test_position_sizing_basic():
         "min_notional_krw": 50000,
     }
     r = RiskManager(cfg, 10_000_000)
-    value = r.compute_position_value(stop_pct=0.012, k_signals=5, coin_exposure_now=0.03)
+    value = r.compute_position_value(
+        stop_pct=0.012, k_signals=5, coin_exposure_now=0.03
+    )
     assert value >= 50_000
+
+
+def test_position_sizing_increases_with_signal_score():
+    cfg = {
+        "risk": {
+            "promote_requirements": {
+                "min_trades": 200,
+                "max_order_error_rate": 0.005,
+                "max_avg_entry_slippage": 0.0025,
+            },
+            "risk_per_trade_start": 0.001,
+            "risk_per_trade_target": 0.002,
+            "daily_stop_loss_pct": -0.02,
+            "max_positions": 10,
+            "total_exposure_cap": 0.70,
+            "per_coin_exposure_cap": 0.12,
+        },
+        "min_notional_krw": 50000,
+    }
+    r = RiskManager(cfg, 10_000_000)
+
+    value_strong = r.compute_position_value(
+        stop_pct=0.012,
+        k_signals=5,
+        coin_exposure_now=0.0,
+        signal_score=100,
+    )
+    value_week = r.compute_position_value(
+        stop_pct=0.012,
+        k_signals=5,
+        coin_exposure_now=0.0,
+        signal_score=60,
+    )
+
+    assert value_strong > value_week
+
+
+def test_position_sizing_respects_volatility_regime():
+    cfg = {
+        "risk": {
+            "promote_requirements": {
+                "min_trades": 200,
+                "max_order_error_rate": 0.005,
+                "max_avg_entry_slippage": 0.0025,
+            },
+            "risk_per_trade_start": 0.001,
+            "risk_per_trade_target": 0.002,
+            "daily_stop_loss_pct": -0.02,
+            "max_positions": 10,
+            "total_exposure_cap": 0.70,
+            "per_coin_exposure_cap": 0.12,
+        },
+        "min_notional_krw": 50000,
+    }
+    r = RiskManager(cfg, 1_000_000)
+
+    value_low_vol = r.compute_position_value(
+        stop_pct=0.012,
+        k_signals=5,
+        coin_exposure_now=0.0,
+        signal_score=95,
+        volatility_regime="low",
+    )
+    value_normal = r.compute_position_value(
+        stop_pct=0.012,
+        k_signals=5,
+        coin_exposure_now=0.0,
+        signal_score=95,
+        volatility_regime="normal",
+    )
+    value_high_vol = r.compute_position_value(
+        stop_pct=0.012,
+        k_signals=5,
+        coin_exposure_now=0.0,
+        signal_score=95,
+        volatility_regime="high",
+    )
+
+    assert value_high_vol < value_normal <= value_low_vol
 
 
 def test_daily_stop_blocks_entry():
@@ -68,5 +149,7 @@ def test_position_sizing_respects_stop_safe_min_entry():
     }
     r = RiskManager(cfg, 10_000)
     # 리스크 계산값이 작아도 최소 진입값(5500) 미만이면 0으로 차단되어야 함
-    value = r.compute_position_value(stop_pct=0.02, k_signals=1, coin_exposure_now=0.0, signal_score=50)
+    value = r.compute_position_value(
+        stop_pct=0.02, k_signals=1, coin_exposure_now=0.0, signal_score=50
+    )
     assert value == 0.0

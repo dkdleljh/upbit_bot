@@ -1,5 +1,11 @@
 from dataclasses import dataclass, field
-from typing import List
+from datetime import datetime
+from typing import Any, List
+
+try:
+    from zoneinfo import ZoneInfo
+except Exception:
+    ZoneInfo = None
 from .indicators import adaptive_atr_multiplier
 
 
@@ -24,11 +30,12 @@ class RiskManager:
     DRAWDOWN_BREAKER_PCT = -0.15
     KELLY_HISTORY_SIZE = 20
 
-    def __init__(self, cfg: dict, initial_equity: float):
+    def __init__(self, cfg: dict[str, Any], initial_equity: float):
         self.cfg = cfg
         self.initial_equity = initial_equity
         self.equity = initial_equity
         self.realized_pnl = 0.0
+        self.daily_realized_pnl = 0.0
         self.daily_realized_pct = 0.0
         self.stats = TradeStats()
 
@@ -50,6 +57,26 @@ class RiskManager:
         self.mtm_drawdown_stop_pct = mtm_cfg.get("mtm_drawdown_stop_pct", -0.12)
         self.unrealized_pnl = 0.0
         self.peak_equity_mtm = initial_equity
+        self._risk_tz = self._resolve_timezone(cfg)
+        self._risk_day = datetime.now(tz=self._risk_tz).date()
+
+    def _resolve_timezone(self, cfg: dict[str, Any]):
+        tz_name = str(cfg.get("timezone") or "Asia/Seoul")
+        if ZoneInfo is None:
+            return datetime.now().astimezone().tzinfo
+        try:
+            return ZoneInfo(tz_name)
+        except Exception:
+            return datetime.now().astimezone().tzinfo
+
+    def roll_daily(self) -> None:
+        today = datetime.now(tz=self._risk_tz).date()
+        if today == self._risk_day:
+            return
+
+        self._risk_day = today
+        self.daily_realized_pnl = 0.0
+        self.daily_realized_pct = 0.0
 
     def update_unrealized(self, unrealized_pnl: float) -> None:
         self.unrealized_pnl = unrealized_pnl
@@ -175,9 +202,11 @@ class RiskManager:
         return kelly
 
     def update_realized(self, pnl_value: float) -> None:
+        self.roll_daily()
         self.realized_pnl += pnl_value
+        self.daily_realized_pnl += pnl_value
         self.equity += pnl_value
-        self.daily_realized_pct = self.realized_pnl / self.initial_equity
+        self.daily_realized_pct = self.daily_realized_pnl / self.initial_equity
 
     def can_open_new_entry(self, open_positions: int, total_exposure: float) -> bool:
         if self.is_drawdown_breaker_triggered():
@@ -279,7 +308,8 @@ class RiskManager:
         return max(min_notional, required_by_stop, configured_min)
 
     def update_daily_pnl(self, unrealized_pnl: float) -> None:
-        current_total_pct = self.daily_realized_pct + (
-            unrealized_pnl / max(1.0, self.initial_equity)
+        self.roll_daily()
+        current_total_pct = (self.daily_realized_pnl + unrealized_pnl) / max(
+            1.0, self.initial_equity
         )
         self.daily_realized_pct = current_total_pct

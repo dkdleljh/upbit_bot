@@ -2,6 +2,7 @@ import asyncio
 import logging
 import random
 from collections import deque
+from typing import Any
 
 from .execution import ExecutionEngine
 from .indicators import atr, ema, rsi, stop_pct_from_atr
@@ -13,16 +14,19 @@ from .utils import now_ms, parse_market
 LOGGER = logging.getLogger(__name__)
 
 
-def run_backtest_30d(cfg: dict) -> dict:
+def run_backtest_30d(cfg: dict[str, Any]) -> dict[str, Any]:
     """Legacy 백테스트 (단순 시뮬레이션 - 실제 데이터 기반 아님).
-    
+
     경고: 이 함수는 실제 백테스트 결과가 아닌 근사값을 반환합니다.
     정확한 백테스트를 원하시면 config의 backtest_days 설정을 사용하세요.
     """
     import logging
+
     LOGGER = logging.getLogger(__name__)
-    LOGGER.warning("LEGACY BACKTEST: Using estimated results (not actual data-driven). Use config backtest_days for accurate results.")
-    
+    LOGGER.warning(
+        "LEGACY BACKTEST: Using estimated results (not actual data-driven). Use config backtest_days for accurate results."
+    )
+
     total = 220
     wins = 118
     net_pnl = random.uniform(-0.03, 0.08)
@@ -42,6 +46,7 @@ def run_backtest_30d(cfg: dict) -> dict:
 
 
 from .upbit_ws import UpbitWebSocket
+
 
 class TradingStateMachine:
     @staticmethod
@@ -67,7 +72,16 @@ class TradingStateMachine:
             return False
         return (now_ms - stable_since_ms) >= int(recover_seconds) * 1000
 
-    def __init__(self, cfg: dict, rest_client, cache, storage, risk_manager, reporter, mode: str):
+    def __init__(
+        self,
+        cfg: dict[str, Any],
+        rest_client,
+        cache,
+        storage,
+        risk_manager,
+        reporter,
+        mode: str,
+    ):
         self.cfg = cfg
         self.rest = rest_client
         self.cache = cache
@@ -77,11 +91,11 @@ class TradingStateMachine:
         self.mode = mode
         self.exec_engine = ExecutionEngine(cfg, storage, mode, rest_client=rest_client)
         self.portfolio = Portfolio(cfg)
-        self.ws = None # WS 초기화는 initialize에서
+        self.ws = None  # WS 초기화는 initialize에서
 
         # WS 이벤트 폭주 방지: 콜백에서 태스크를 만들지 않고 큐로 넘겨 단일 소비자가 처리
-        self._ws_in_q: asyncio.Queue = asyncio.Queue(maxsize=5000)
-        self._ws_consumer_task: asyncio.Task | None = None
+        self._ws_in_q: asyncio.Queue[dict[str, Any]] = asyncio.Queue(maxsize=5000)
+        self._ws_consumer_task: asyncio.Task[None] | None = None
         self._ws_drop_count: int = 0
         self._last_ws_drop_event_ms: int = 0
 
@@ -144,7 +158,12 @@ class TradingStateMachine:
     async def initialize(self):
         # 0) 마켓 목록 확보
         try:
-            self.all_markets = await self._call_with_retry(lambda: self.rest.get_markets(), name="get_markets_init") or []
+            self.all_markets = (
+                await self._call_with_retry(
+                    lambda: self.rest.get_markets(), name="get_markets_init"
+                )
+                or []
+            )
         except Exception as e:
             LOGGER.warning("get_markets failed: %s", e)
             self.all_markets = []
@@ -159,7 +178,12 @@ class TradingStateMachine:
                     seed_markets.append(m)
 
             try:
-                tickers = await self._call_with_retry(lambda: self.rest.get_tickers(seed_markets), name="seed_tickers") or []
+                tickers = (
+                    await self._call_with_retry(
+                        lambda: self.rest.get_tickers(seed_markets), name="seed_tickers"
+                    )
+                    or []
+                )
             except Exception as e:
                 LOGGER.warning("seed tickers failed: %s", e)
                 tickers = []
@@ -167,7 +191,13 @@ class TradingStateMachine:
                 await self.cache.seed_tickers(tickers)
 
             try:
-                obs = await self._call_with_retry(lambda: self.rest.get_orderbook(seed_markets[:30]), name="seed_orderbook") or []
+                obs = (
+                    await self._call_with_retry(
+                        lambda: self.rest.get_orderbook(seed_markets[:30]),
+                        name="seed_orderbook",
+                    )
+                    or []
+                )
             except Exception as e:
                 LOGGER.warning("seed orderbook failed: %s", e)
                 obs = []
@@ -187,7 +217,9 @@ class TradingStateMachine:
         self.ws.add_callback(self._on_ws_data)
         await self.ws.start()
         try:
-            self.storage.log_event("INFO", "WS_STARTED", None, f"markets={len(markets)}")
+            self.storage.log_event(
+                "INFO", "WS_STARTED", None, f"markets={len(markets)}"
+            )
         except Exception:
             pass
 
@@ -199,33 +231,44 @@ class TradingStateMachine:
         self._stop_event = stop_event
         await self.initialize()
         await self.reporter.start()
-        
+
         # 하이브리드 모드:
         # 1. WS: 실시간 시세 수신 -> 손절(SL) 감시 (0.1초 반응)
         # 2. Loop: 10초마다 진입/익절 판단 (10초 반응)
-        loop_interval = max(1.0, float(self.cfg.get("runtime", {}).get("loop_interval_seconds", 10)))
+        loop_interval = max(
+            1.0, float(self.cfg.get("runtime", {}).get("loop_interval_seconds", 10))
+        )
         while not (self._stop_event and self._stop_event.is_set()):
             try:
                 await self._cycle()
-                
+
                 # 구독 목록 변경 감지 시 WS 재구독
                 if self.ws and set(self.ws.markets) != set(self.universe_top10):
-                     LOGGER.info("유니버스 변경으로 WS 재구독...")
-                     await self.ws.stop()
-                     try:
-                         self.storage.log_event("INFO", "WS_STOPPED", None, "universe_resubscribe")
-                     except Exception:
-                         pass
-                     self.ws.markets = list(self.universe_top10)
-                     await self.ws.start()
-                     try:
-                         self.storage.log_event("INFO", "WS_STARTED", None, f"markets={len(self.ws.markets)} universe_resubscribe")
-                     except Exception:
-                         pass
+                    LOGGER.info("유니버스 변경으로 WS 재구독...")
+                    await self.ws.stop()
+                    try:
+                        self.storage.log_event(
+                            "INFO", "WS_STOPPED", None, "universe_resubscribe"
+                        )
+                    except Exception:
+                        pass
+                    self.ws.markets = list(self.universe_top10)
+                    await self.ws.start()
+                    try:
+                        self.storage.log_event(
+                            "INFO",
+                            "WS_STARTED",
+                            None,
+                            f"markets={len(self.ws.markets)} universe_resubscribe",
+                        )
+                    except Exception:
+                        pass
 
-                     # 소비자는 유지되지만, 혹시 죽어있으면 재기동
-                     if self._ws_consumer_task is None or self._ws_consumer_task.done():
-                         self._ws_consumer_task = asyncio.create_task(self._ws_consumer_loop())
+                    # 소비자는 유지되지만, 혹시 죽어있으면 재기동
+                    if self._ws_consumer_task is None or self._ws_consumer_task.done():
+                        self._ws_consumer_task = asyncio.create_task(
+                            self._ws_consumer_loop()
+                        )
 
             except Exception as e:
                 LOGGER.exception("Main Loop Error: %s", e)
@@ -233,7 +276,9 @@ class TradingStateMachine:
             # 10초 고정 슬립 대신 stop_event를 기다려 빠른 종료를 지원
             try:
                 if self._stop_event is not None:
-                    await asyncio.wait_for(self._stop_event.wait(), timeout=loop_interval)
+                    await asyncio.wait_for(
+                        self._stop_event.wait(), timeout=loop_interval
+                    )
                 else:
                     await asyncio.sleep(loop_interval)
             except asyncio.TimeoutError:
@@ -254,7 +299,7 @@ class TradingStateMachine:
         except Exception as e:
             LOGGER.warning("state machine shutdown warning: %s", e)
 
-    def _on_ws_data(self, data: dict):
+    def _on_ws_data(self, data: dict[str, Any]):
         # WS 콜백에서 create_task를 무한히 만들면 폭주/지연이 생길 수 있어 큐로 넘깁니다.
         try:
             if not self._ws_in_q.full():
@@ -292,12 +337,12 @@ class TradingStateMachine:
                 LOGGER.exception("WS consumer error: %s", e)
                 await asyncio.sleep(0.2)
 
-    async def _process_ws_data_async(self, data: dict):
+    async def _process_ws_data_async(self, data: dict[str, Any]):
         ty = data.get("type")
         code = data.get("code")
         if not code:
             return
-        
+
         if ty == "ticker":
             # 1. 시세 업데이트 (캐시 갱신)
             # WS 데이터 포맷 -> Cache 포맷 변환 필요
@@ -309,15 +354,17 @@ class TradingStateMachine:
             if now - self._last_ws_tick_event_ms >= 60_000:
                 self._last_ws_tick_event_ms = now
                 try:
-                    self.storage.log_event("INFO", "WS_TICK_OK", code, f"trade_price={px}")
+                    self.storage.log_event(
+                        "INFO", "WS_TICK_OK", code, f"trade_price={px}"
+                    )
                 except Exception:
                     pass
             # await self.cache.update_price(code, px) # (가상 메서드)
-            
+
             # 2. 매매 판단 (Fast Path)
             # 가격이 변했을 때만 포지션 체크
             await self._process_exits_fast(code, px)
-            
+
             # 3. 진입 판단 (Signal Check)
             # 1초에 1번 정도만 체크 (Throttle)
             # 과거 인스턴스/이상 상태에서 속성이 누락돼도 죽지 않도록 방어
@@ -342,7 +389,10 @@ class TradingStateMachine:
                 return
 
             # 복원(기존보유) 포지션은 즉시 WS 손절을 걸면 과매도/휩쏘로 손실 확률이 커서 유예시간을 둡니다.
-            grace_s = int(self.cfg.get("live", {}).get("restored_stoploss_grace_seconds", 300) or 0)
+            grace_s = int(
+                self.cfg.get("live", {}).get("restored_stoploss_grace_seconds", 300)
+                or 0
+            )
             if p.restored and grace_s > 0:
                 age_s = (now_ms() - (p.restored_ts_ms or p.entry_ts_ms)) // 1000
                 if age_s < grace_s:
@@ -367,10 +417,23 @@ class TradingStateMachine:
 
                     # SELL의 최소주문금액(더스트) 판단을 위해 대략적인 주문금액을 넘깁니다.
                     order_value_krw = float(p.qty) * float(current_price)
-                    res = await self.exec_engine.execute_market(market, "SELL", order_value_krw, p.qty, current_price, 0.002, "stop_loss_ws")
+                    res = await self.exec_engine.execute_market(
+                        market,
+                        "SELL",
+                        order_value_krw,
+                        p.qty,
+                        current_price,
+                        0.002,
+                        "stop_loss_ws",
+                    )
                     if not res.ok:
                         try:
-                            self.storage.log_event("WARN", "SELL_FAIL", market, f"reason={res.reason} action=stop_loss_ws")
+                            self.storage.log_event(
+                                "WARN",
+                                "SELL_FAIL",
+                                market,
+                                f"reason={res.reason} action=stop_loss_ws",
+                            )
                         except Exception:
                             pass
                     else:
@@ -384,7 +447,9 @@ class TradingStateMachine:
                         except Exception:
                             pass
 
-                    LOGGER.info(f"WS STOP LOSS triggered for {market} at {current_price}")
+                    LOGGER.info(
+                        f"WS STOP LOSS triggered for {market} at {current_price}"
+                    )
                 finally:
                     self._exit_inflight.discard(market)
 
@@ -393,10 +458,17 @@ class TradingStateMachine:
 
                 # market 단위 격리(추천값): WS 손절이 반복되는 코인은 단계적으로 격리 시간을 늘려 루프를 차단
                 try:
-                    live_cfg = (self.cfg.get("live", {}) or {})
-                    base_min = int(live_cfg.get("market_quarantine_on_stoploss_minutes", 30) or 30)
-                    max_min = int(live_cfg.get("market_quarantine_max_minutes", 360) or 360)
-                    window_s = int(live_cfg.get("market_quarantine_stoploss_window_seconds", 3600) or 3600)
+                    live_cfg = self.cfg.get("live", {}) or {}
+                    base_min = int(
+                        live_cfg.get("market_quarantine_on_stoploss_minutes", 30) or 30
+                    )
+                    max_min = int(
+                        live_cfg.get("market_quarantine_max_minutes", 360) or 360
+                    )
+                    window_s = int(
+                        live_cfg.get("market_quarantine_stoploss_window_seconds", 3600)
+                        or 3600
+                    )
 
                     dq = self._market_stoploss_events_ms.get(market)
                     if dq is None:
@@ -414,14 +486,21 @@ class TradingStateMachine:
                     self.exec_engine.cooldown_until_ms[market] = nowv + q_min * 60_000
 
                     try:
-                        self.storage.log_event("WARN", "MARKET_QUARANTINE", market, f"reason=stoploss_ws hits={hits} window_s={window_s} minutes={q_min}")
+                        self.storage.log_event(
+                            "WARN",
+                            "MARKET_QUARANTINE",
+                            market,
+                            f"reason=stoploss_ws hits={hits} window_s={window_s} minutes={q_min}",
+                        )
                     except Exception:
                         pass
                 except Exception:
                     pass
 
                 try:
-                    self.storage.log_event("WARN", "STOPLOSS_WS", market, f"px={current_price}")
+                    self.storage.log_event(
+                        "WARN", "STOPLOSS_WS", market, f"px={current_price}"
+                    )
                 except Exception:
                     pass
                 return
@@ -438,26 +517,39 @@ class TradingStateMachine:
         # 기존 _cycle의 관리 작업들 (포지션 싱크, 스냅샷 등)
         if self.mode == "live" and getattr(self.rest, "is_live_ready", False):
             await self._sync_portfolio_with_accounts()
-        await self._snapshot_positions({}) # last_prices는 WS 캐시에서 가져와야 함
+        await self._snapshot_positions({})  # last_prices는 WS 캐시에서 가져와야 함
 
     async def _cycle(self):
         now = now_ms()
 
+        self.risk.roll_daily()
+
         # live 모드에서만 safe_mode 발동 (paper 모드는 공용 API 429로 인한 진입 차단 방지)
-        if self.mode == "live" and self.rest.error_count >= self.cfg["runtime"]["safe_mode_error_threshold"]:
+        if (
+            self.mode == "live"
+            and self.rest.error_count
+            >= self.cfg["runtime"]["safe_mode_error_threshold"]
+        ):
             if not self.safe_mode:
                 self._safe_mode_since_ms = now
                 try:
-                    self.storage.log_event("ERROR", "SAFE_MODE_ON", None, f"error_count={self.rest.error_count}")
+                    self.storage.log_event(
+                        "ERROR",
+                        "SAFE_MODE_ON",
+                        None,
+                        f"error_count={self.rest.error_count}",
+                    )
                 except Exception:
                     pass
             self.safe_mode = True
 
         # safe_mode 자동 복구(조건 충족 시)
         if self.mode == "live" and self.safe_mode:
-            live_cfg = (self.cfg.get("live", {}) or {})
+            live_cfg = self.cfg.get("live", {}) or {}
             recover_s = int(live_cfg.get("safe_mode_recover_seconds", 900) or 900)
-            stable_since = max(self._safe_mode_since_ms or 0, self._last_order_error_ms or 0)
+            stable_since = max(
+                self._safe_mode_since_ms or 0, self._last_order_error_ms or 0
+            )
             if self._should_auto_recover_safe_mode(
                 safe_mode=self.safe_mode,
                 error_count=int(getattr(self.rest, "error_count", 0) or 0),
@@ -469,7 +561,9 @@ class TradingStateMachine:
             ):
                 self.safe_mode = False
                 try:
-                    self.storage.log_event("INFO", "SAFE_MODE_OFF", None, f"stable_s>={recover_s}")
+                    self.storage.log_event(
+                        "INFO", "SAFE_MODE_OFF", None, f"stable_s>={recover_s}"
+                    )
                 except Exception:
                     pass
 
@@ -479,14 +573,18 @@ class TradingStateMachine:
                 self._entry_pause_logged = True
                 try:
                     left_s = int((self._entry_pause_until_ms - now) / 1000)
-                    self.storage.log_event("WARN", "ENTRY_PAUSED", None, f"left_s={left_s}")
+                    self.storage.log_event(
+                        "WARN", "ENTRY_PAUSED", None, f"left_s={left_s}"
+                    )
                 except Exception:
                     pass
         else:
             if self._entry_pause_logged:
                 self._entry_pause_logged = False
                 try:
-                    self.storage.log_event("INFO", "ENTRY_RESUMED", None, "pause_expired")
+                    self.storage.log_event(
+                        "INFO", "ENTRY_RESUMED", None, "pause_expired"
+                    )
                 except Exception:
                     pass
 
@@ -495,7 +593,11 @@ class TradingStateMachine:
             self._last_heartbeat_event_ms = now
             try:
                 paused_left = max(0, int((self._entry_pause_until_ms - now) / 1000))
-                last_ws_age_s = -1 if self._last_ws_tick_ms <= 0 else int((now - self._last_ws_tick_ms) / 1000)
+                last_ws_age_s = (
+                    -1
+                    if self._last_ws_tick_ms <= 0
+                    else int((now - self._last_ws_tick_ms) / 1000)
+                )
                 if self._last_candle_success_ms:
                     last_candle_ms = max(self._last_candle_success_ms.values())
                     last_candle_age_s = int((now - last_candle_ms) / 1000)
@@ -505,7 +607,7 @@ class TradingStateMachine:
                     "INFO",
                     "STRATEGY_HEARTBEAT",
                     None,
-                    f"mode={self.mode} safe_mode={self.safe_mode} err_count={getattr(self.rest,'error_count',None)} "
+                    f"mode={self.mode} safe_mode={self.safe_mode} err_count={getattr(self.rest, 'error_count', None)} "
                     f"positions={len(self.portfolio.positions)} paused_left_s={paused_left} ws_q={self._ws_in_q.qsize()} "
                     f"drops={self._ws_drop_count} last_ws_tick_age_s={last_ws_age_s} "
                     f"last_ws_market={self._last_ws_tick_market or '-'} last_candle_age_s={last_candle_age_s}",
@@ -527,7 +629,13 @@ class TradingStateMachine:
         # 5분봉 데이터(MTF) 조회 - Top10 종목 대상
         mtf_trends = {}
         for m in self.universe_top10:
-            c5 = await self._call_with_retry(lambda: self.rest.get_candles_minutes(m, unit=5, count=20), name=f"get_candles_5m:{m}") or []
+            c5 = (
+                await self._call_with_retry(
+                    lambda: self.rest.get_candles_minutes(m, unit=5, count=20),
+                    name=f"get_candles_5m:{m}",
+                )
+                or []
+            )
             if len(c5) >= 20:
                 closes5 = [float(x["trade_price"]) for x in reversed(c5)]
                 ma20_5m = ema(closes5, 20)
@@ -548,15 +656,21 @@ class TradingStateMachine:
                 continue
 
             spread_pct = self.exec_engine._spread_pct(ob)
-            depth_ratio = self.exec_engine._depth_ratio(ob, self.cfg["min_notional_krw"], "BUY")
+            depth_ratio = self.exec_engine._depth_ratio(
+                ob, self.cfg["min_notional_krw"], "BUY"
+            )
             notional_ratio = await self.cache.get_notional_ratio(m, lookback=20)
-            
+
             # MTF 추세 전달
             mtf_ok = mtf_trends.get(m, True)
             ob = orderbooks.get(m)
-            
-            profile = str((self.cfg.get("signal", {}) or {}).get("profile", "full")).lower()
-            builder = build_signal_simple if profile in {"simple", "lite"} else build_signal
+
+            profile = str(
+                (self.cfg.get("signal", {}) or {}).get("profile", "full")
+            ).lower()
+            builder = (
+                build_signal_simple if profile in {"simple", "lite"} else build_signal
+            )
 
             sig = builder(
                 market=m,
@@ -596,7 +710,11 @@ class TradingStateMachine:
 
     async def refresh_universe(self, force: bool = False):
         now = now_ms()
-        if not force and now - self.last_universe_refresh_ms < self.cfg["universe"]["refresh_seconds"] * 1000:
+        if (
+            not force
+            and now - self.last_universe_refresh_ms
+            < self.cfg["universe"]["refresh_seconds"] * 1000
+        ):
             return
 
         tickers, orderbooks = await self.cache.snapshot()
@@ -612,8 +730,25 @@ class TradingStateMachine:
         top30_markets = [x["market"] for x in top30_candidates]
 
         # 2) top30 후보의 orderbook을 다시 수집해서 캐시에 채움
-        fetched = await self._call_with_retry(lambda: self.rest.get_orderbook(top30_markets), name="refresh_universe_orderbook") or []
+        fetched = (
+            await self._call_with_retry(
+                lambda: self.rest.get_orderbook(top30_markets),
+                name="refresh_universe_orderbook",
+            )
+            or []
+        )
         if not fetched:
+            if self.mode == "live":
+                try:
+                    self.storage.log_event(
+                        "WARN",
+                        "UNIVERSE_ORDERBOOK_FETCH_FAIL",
+                        None,
+                        "skip_universe_refresh_in_live",
+                    )
+                except Exception:
+                    pass
+                return
             fetched = self._mock_orderbooks(top30_markets, tickers_list)
 
         await self.cache.seed_orderbooks(fetched)
@@ -630,7 +765,12 @@ class TradingStateMachine:
 
         self.universe_top10 = [x["market"] for x in top10]
         self.last_universe_refresh_ms = now
-        LOGGER.info("유니버스 갱신 top30=%d tradable=%d top10=%s", len(top30), len(tradable), self.universe_top10)
+        LOGGER.info(
+            "유니버스 갱신 top30=%d tradable=%d top10=%s",
+            len(top30),
+            len(tradable),
+            self.universe_top10,
+        )
 
     async def _sync_portfolio_with_accounts(self, force: bool = False):
         """실계좌 보유 기준으로 포트폴리오를 동기화합니다.
@@ -645,7 +785,9 @@ class TradingStateMachine:
         self._last_live_sync_ms = now
 
         try:
-            accts = await self._call_with_retry(lambda: self.rest.get_accounts(), name="get_accounts_sync")
+            accts = await self._call_with_retry(
+                lambda: self.rest.get_accounts(), name="get_accounts_sync"
+            )
         except Exception:
             return
         if not isinstance(accts, list):
@@ -655,7 +797,7 @@ class TradingStateMachine:
         await self._maybe_snapshot_equity(accts)
 
         # accounts: [{currency, balance, locked, avg_buy_price, ...}, ...]
-        actual: dict[str, dict] = {}
+        actual: dict[str, dict[str, float]] = {}
         min_notional = float(self.cfg.get("min_notional_krw", 5000))
         for a in accts:
             cur = str(a.get("currency") or "")
@@ -683,12 +825,17 @@ class TradingStateMachine:
                 self.portfolio.remove(m)
                 continue
             self.portfolio.positions[m].qty = float(info["qty"])
-            if self.portfolio.positions[m].entry_price <= 0 and float(info.get("avg") or 0) > 0:
+            if (
+                self.portfolio.positions[m].entry_price <= 0
+                and float(info.get("avg") or 0) > 0
+            ):
                 self.portfolio.positions[m].entry_price = float(info["avg"])
 
         # 2) 실보유가 있는데 내부에 없으면 복원(KRW 마켓이 존재할 때만)
         # 기본은 안전하게 '복원하지 않음'(봇이 산 것만 관리). 필요 시 config.live.manage_existing_positions=true
-        manage_existing = bool(self.cfg.get("live", {}).get("manage_existing_positions", False))
+        manage_existing = bool(
+            self.cfg.get("live", {}).get("manage_existing_positions", False)
+        )
         if manage_existing:
             existing_bases = {p.base_coin for p in self.portfolio.positions.values()}
             for base, info in actual.items():
@@ -711,9 +858,11 @@ class TradingStateMachine:
                     restored=True,
                 )
 
-    async def _maybe_snapshot_equity(self, accts: list[dict]) -> None:
+    async def _maybe_snapshot_equity(self, accts: list[dict[str, Any]]) -> None:
         """실계좌 기반 평가금액(미실현 포함)을 주기적으로 DB에 저장합니다."""
-        interval_s = int(self.cfg.get("runtime", {}).get("equity_snapshot_seconds", 300))
+        interval_s = int(
+            self.cfg.get("runtime", {}).get("equity_snapshot_seconds", 300)
+        )
         if interval_s <= 0:
             return
         now = now_ms()
@@ -740,8 +889,17 @@ class TradingStateMachine:
                 assets.append((cur, qty_total, avg))
 
             markets = [f"KRW-{cur}" for cur, _, _ in assets]
-            tickers = await self._call_with_retry(lambda: self.rest.get_tickers(markets), name="get_tickers_equity") if markets else []
-            px = {t.get("market"): float(t.get("trade_price") or 0.0) for t in (tickers or [])}
+            tickers = (
+                await self._call_with_retry(
+                    lambda: self.rest.get_tickers(markets), name="get_tickers_equity"
+                )
+                if markets
+                else []
+            )
+            px = {
+                t.get("market"): float(t.get("trade_price") or 0.0)
+                for t in (tickers or [])
+            }
 
             asset_value = 0.0
             cost_basis = 0.0
@@ -795,7 +953,9 @@ class TradingStateMachine:
             self._stoploss_events_ms.popleft()
 
         if len(self._stoploss_events_ms) >= max_n:
-            self._entry_pause_until_ms = max(self._entry_pause_until_ms, t + pause_m * 60 * 1000)
+            self._entry_pause_until_ms = max(
+                self._entry_pause_until_ms, t + pause_m * 60 * 1000
+            )
             LOGGER.warning(
                 "CIRCUIT_BREAKER: stoploss_events=%d within %ds -> pause entries for %dm",
                 len(self._stoploss_events_ms),
@@ -814,7 +974,9 @@ class TradingStateMachine:
 
     def _record_order_error_and_maybe_pause(self, err_reason: str = "") -> None:
         """주문 오류 이벤트를 기록하고 연속 발생 시 신규 진입을 일시 중단합니다."""
-        cfg = (self.cfg.get("live", {}) or {}).get("circuit_breaker_order_errors", {}) or {}
+        cfg = (self.cfg.get("live", {}) or {}).get(
+            "circuit_breaker_order_errors", {}
+        ) or {}
         window_s = int(cfg.get("window_seconds", 180) or 180)
         max_n = int(cfg.get("max_error_events", 3) or 3)
         pause_m = int(cfg.get("pause_minutes", 20) or 20)
@@ -833,7 +995,9 @@ class TradingStateMachine:
             self._order_error_events_ms.popleft()
 
         if len(self._order_error_events_ms) >= max_n:
-            self._entry_pause_until_ms = max(self._entry_pause_until_ms, t + pause_m * 60 * 1000)
+            self._entry_pause_until_ms = max(
+                self._entry_pause_until_ms, t + pause_m * 60 * 1000
+            )
             LOGGER.warning(
                 "CIRCUIT_BREAKER_ORDER_ERRORS: errors=%d within %ds (last=%s) -> pause entries for %dm",
                 len(self._order_error_events_ms),
@@ -852,7 +1016,9 @@ class TradingStateMachine:
                 pass
 
             # 옵션이 켜져 있으면 안전모드로 승격(잔고/레이트리밋/권한 문제 등으로 주문이 계속 실패하는 상황)
-            if bool((self.cfg.get("live", {}) or {}).get("safe_mode_on_order_errors", True)):
+            if bool(
+                (self.cfg.get("live", {}) or {}).get("safe_mode_on_order_errors", True)
+            ):
                 if not self.safe_mode:
                     self.safe_mode = True
                     self._safe_mode_since_ms = t
@@ -868,18 +1034,18 @@ class TradingStateMachine:
 
     async def _btc_regime_ok(self) -> bool:
         candles = await self.cache.get_candles("KRW-BTC")
-        if len(candles) < 20: # 최소 20개는 있어야 단기 추세라도 봄
+        if len(candles) < 20:  # 최소 20개는 있어야 단기 추세라도 봄
             # 데이터 부족 시: 안전하게 False? 아니면 공격적으로 True?
             # 장 초반엔 True로 해줘야 진입 가능 (단, 리스크 감수)
-            return True 
-            
+            return True
+
         closes = [float(x["close"]) for x in candles]
-        
+
         # 1. 급락 감지 (Flash Crash Protection)
         # 현재가가 1시간 전(60분 전) 대비 -1.0% 이상 하락 시 매수 금지
         if len(closes) >= 60:
             change_1h = (closes[-1] - closes[-60]) / closes[-60]
-            if change_1h < -0.01: # -1% 급락
+            if change_1h < -0.01:  # -1% 급락
                 LOGGER.warning(f"BTC 급락 감지! (-{abs(change_1h):.2%}) 매수 중단.")
                 return False
 
@@ -895,10 +1061,10 @@ class TradingStateMachine:
         period_long = min(len(closes), 60)
         ema_short = ema(closes, 20)
         ema_long = ema(closes, period_long)
-        
+
         if ema_short is None or ema_long is None:
             return True
-            
+
         return ema_short >= ema_long
 
     async def _process_entries(self, signals, last_prices, orderbooks):
@@ -907,14 +1073,16 @@ class TradingStateMachine:
         if now_ms() < self._entry_pause_until_ms:
             return
 
-        total_exposure = self.portfolio.total_exposure_ratio(self.risk.equity, last_prices)
-        
+        total_exposure = self.portfolio.total_exposure_ratio(
+            self.risk.equity, last_prices
+        )
+
         # 1. 신규 진입 대상 필터링
         tradables = [s for s in signals if s.tradable]
         if not tradables:
             return
 
-        for s in tradables[:5]: # 상위 5개까지만 검토
+        for s in tradables[:5]:  # 상위 5개까지만 검토
             market = s.market
             # 마켓 격리/쿨다운(WS 손절 등) 중이면 진입 금지
             if self.exec_engine.is_cooldown(market):
@@ -925,40 +1093,44 @@ class TradingStateMachine:
 
             # 매수 ref_price는 현재가보다는 ask1에 가깝게(체결/슬리피지 현실화)
             ob = orderbooks.get(market) or {}
-            units = (ob.get("orderbook_units") or [])
+            units = ob.get("orderbook_units") or []
             ask1 = float(units[0].get("ask_price", 0.0)) if units else 0.0
             px = ask1 if ask1 > 0 else last_prices.get(market, 0.0)
             if px <= 0:
                 continue
-                
+
             # A. 신규 진입 (New Entry)
             if market not in self.portfolio.positions:
-                if not self.risk.can_open_new_entry(self.portfolio.count(), total_exposure):
+                if not self.risk.can_open_new_entry(
+                    self.portfolio.count(), total_exposure
+                ):
                     continue
                 if self.portfolio.count() >= self.cfg["risk"]["max_positions"]:
                     await self._try_replace(s, last_prices)
                     continue
-            
+
             # B. 불타기 (Pyramiding)
             else:
                 # 이미 보유 중 -> 수익 중이고 신호가 강하면 추가 매수
                 pos = self.portfolio.positions[market]
-                
+
                 # 수익률 2% 이상일 때만 불타기
                 pnl_pct = (px - pos.entry_price) / pos.entry_price
-                if pnl_pct < 0.02: 
+                if pnl_pct < 0.02:
                     continue
-                    
+
                 # 최대 3회까지만
                 if pos.adds >= 3:
                     continue
-                    
+
                 # 신규 진입과 동일하게 리스크 한도 체크
                 base = parse_market(market).base
-                coin_exposure = self.portfolio.coin_exposure_ratio(base, self.risk.equity, last_prices)
+                coin_exposure = self.portfolio.coin_exposure_ratio(
+                    base, self.risk.equity, last_prices
+                )
                 if not self.risk.can_add_to_position(coin_exposure, total_exposure):
                     continue
-                    
+
                 LOGGER.info(f"🔥 Pyramiding Signal for {market} (PnL: {pnl_pct:.2%})")
 
             # --- 공통 진입 실행 로직 ---
@@ -975,13 +1147,21 @@ class TradingStateMachine:
             )
 
             base = parse_market(market).base
-            coin_exposure_now = self.portfolio.coin_exposure_ratio(base, self.risk.equity, last_prices)
-            
+            coin_exposure_now = self.portfolio.coin_exposure_ratio(
+                base, self.risk.equity, last_prices
+            )
+
             # Phase 2: 점수에 따른 배팅 금액 조절 (동적 컷오프 적용)
             # 동적 컷오프보다 점수가 훨씬 높으면(예: +10점) 과감하게 베팅
             score_bonus = max(0, s.score - s.dynamic_cutoff)
-            pos_value = self.risk.compute_position_value(stop_pct, len(tradables), coin_exposure_now, signal_score=85 + score_bonus, volatility_regime=vol_regime)
-            
+            pos_value = self.risk.compute_position_value(
+                stop_pct,
+                len(tradables),
+                coin_exposure_now,
+                signal_score=85 + score_bonus,
+                volatility_regime=vol_regime,
+            )
+
             if pos_value < self.cfg["min_notional_krw"]:
                 continue
 
@@ -991,14 +1171,18 @@ class TradingStateMachine:
             quote = parse_market(market).quote
             if quote == "BTC":
                 qkrw = float(last_prices.get("KRW-BTC", 0.0) or 0.0)
-                if qkrw > 0:
-                    gate_order_value = pos_value / qkrw
+                if qkrw <= 0:
+                    continue
+                gate_order_value = pos_value / qkrw
             elif quote == "USDT":
                 qkrw = float(last_prices.get("KRW-USDT", 0.0) or 0.0)
-                if qkrw > 0:
-                    gate_order_value = pos_value / qkrw
+                if qkrw <= 0:
+                    continue
+                gate_order_value = pos_value / qkrw
 
-            gate_ok, gate = self.exec_engine.check_quality_gate(market, orderbooks[market], gate_order_value, "BUY")
+            gate_ok, gate = self.exec_engine.check_quality_gate(
+                market, orderbooks[market], gate_order_value, "BUY"
+            )
             if not gate_ok:
                 continue
 
@@ -1009,8 +1193,8 @@ class TradingStateMachine:
                 quote_krw = float(last_prices.get("KRW-BTC", 0.0) or 0.0)
             elif quote == "USDT":
                 quote_krw = float(last_prices.get("KRW-USDT", 0.0) or 0.0)
-            if quote_krw <= 0:
-                quote_krw = 1.0
+            if quote != "KRW" and quote_krw <= 0:
+                continue
 
             spend_quote = pos_value / quote_krw
             qty = spend_quote / max(px, 1e-12)
@@ -1028,7 +1212,9 @@ class TradingStateMachine:
                 except Exception:
                     pass
 
-                res = await self.exec_engine.execute_market(market, "BUY", pos_value, qty, px, gate["slip_est"], "entry_or_add")
+                res = await self.exec_engine.execute_market(
+                    market, "BUY", pos_value, qty, px, gate["slip_est"], "entry_or_add"
+                )
             finally:
                 self._entry_inflight.discard(market)
 
@@ -1055,7 +1241,9 @@ class TradingStateMachine:
                     self.risk.stats.order_errors += 1
 
                 try:
-                    self.storage.log_event("WARN", "BUY_FAIL", market, f"reason={res.reason}")
+                    self.storage.log_event(
+                        "WARN", "BUY_FAIL", market, f"reason={res.reason}"
+                    )
                 except Exception:
                     pass
 
@@ -1064,7 +1252,9 @@ class TradingStateMachine:
                     self._record_order_error_and_maybe_pause(res.reason)
                 else:
                     try:
-                        self.storage.log_event("WARN", "BUY_SKIP", market, f"reason={res.reason}")
+                        self.storage.log_event(
+                            "WARN", "BUY_SKIP", market, f"reason={res.reason}"
+                        )
                     except Exception:
                         pass
                 continue
@@ -1074,7 +1264,9 @@ class TradingStateMachine:
             if filled_qty <= 1e-12:
                 self.risk.stats.order_errors += 1
                 try:
-                    self.storage.log_event("WARN", "BUY_FAIL", market, "filled_qty_zero")
+                    self.storage.log_event(
+                        "WARN", "BUY_FAIL", market, "filled_qty_zero"
+                    )
                 except Exception:
                     pass
                 self._record_order_error_and_maybe_pause("filled_qty_zero")
@@ -1082,37 +1274,60 @@ class TradingStateMachine:
 
             if market not in self.portfolio.positions:
                 stop_price = res.fill_price * (1 - stop_pct)
-                self.portfolio.add(market, filled_qty, res.fill_price, stop_price, s.score, volatility_regime=s.volatility_regime)
+                self.portfolio.add(
+                    market,
+                    filled_qty,
+                    res.fill_price,
+                    stop_price,
+                    s.score,
+                    volatility_regime=s.volatility_regime,
+                )
                 try:
-                    self.storage.log_event("INFO", "BUY_OK", market, f"fill_px={res.fill_price:.4f} qty={filled_qty:.8f}")
+                    self.storage.log_event(
+                        "INFO",
+                        "BUY_OK",
+                        market,
+                        f"fill_px={res.fill_price:.4f} qty={filled_qty:.8f}",
+                    )
                 except Exception:
                     pass
             else:
                 # 추가 매수: 평단가 갱신 및 스탑로스 상향 (Trailing Up)
                 old_p = self.portfolio.positions[market]
                 new_qty = old_p.qty + filled_qty
-                new_avg = ((old_p.qty * old_p.entry_price) + (filled_qty * res.fill_price)) / new_qty
-                
+                new_avg = (
+                    (old_p.qty * old_p.entry_price) + (filled_qty * res.fill_price)
+                ) / new_qty
+
                 # 스탑로스는 '새 평단가' 기준이 아니라, '현재가' 기준으로 타이트하게 올림 (수익 보전)
-                new_stop = px * (1 - stop_pct) 
+                new_stop = px * (1 - stop_pct)
                 # 기존 스탑보다 낮아지면 안 됨 (Trailing Stop 원칙)
                 if new_stop < old_p.stop_price:
                     new_stop = old_p.stop_price
-                    
+
                 old_p.qty = new_qty
                 old_p.entry_price = new_avg
                 old_p.stop_price = new_stop
-                old_p.adds += 1 # 불타기 횟수 증가
-                LOGGER.info(f"Position Added: {market} NewQty={new_qty:.4f} NewAvg={new_avg:.2f} NewStop={new_stop:.2f}")
+                old_p.adds += 1  # 불타기 횟수 증가
+                LOGGER.info(
+                    f"Position Added: {market} NewQty={new_qty:.4f} NewAvg={new_avg:.2f} NewStop={new_stop:.2f}"
+                )
                 try:
-                    self.storage.log_event("INFO", "BUY_OK", market, f"add fill_px={res.fill_price:.4f} qty={filled_qty:.8f} new_avg={new_avg:.4f}")
+                    self.storage.log_event(
+                        "INFO",
+                        "BUY_OK",
+                        market,
+                        f"add fill_px={res.fill_price:.4f} qty={filled_qty:.8f} new_avg={new_avg:.4f}",
+                    )
                 except Exception:
                     pass
 
             self.risk.stats.total_trades += 1
             n = self.risk.stats.total_trades
             prev = self.risk.stats.avg_entry_slippage
-            self.risk.stats.avg_entry_slippage = ((prev * (n - 1)) + res.slippage_pct) / n
+            self.risk.stats.avg_entry_slippage = (
+                (prev * (n - 1)) + res.slippage_pct
+            ) / n
 
     async def _process_exits(self, last_prices, orderbooks=None):
         """청산 로직.
@@ -1131,14 +1346,16 @@ class TradingStateMachine:
 
             # SELL은 bid1 기준으로 지정가 체결 유도 (없으면 ticker fallback)
             ob = orderbooks.get(market) or {}
-            units = (ob.get("orderbook_units") or [])
+            units = ob.get("orderbook_units") or []
             bid1 = float(units[0].get("bid_price", 0.0)) if units else 0.0
             px = bid1 if bid1 > 0 else px_ticker
 
             fee_rate = float(self.cfg["fees"].get(market.split("-")[0], 0.001))
             slip_est = self.exec_engine.estimate_slippage(market, 0.001)
             vol_regime = p0.volatility_regime
-            actions = self.portfolio.evaluate_exits(market, px, fee_rate, slip_est, volatility_regime=vol_regime)
+            actions = self.portfolio.evaluate_exits(
+                market, px, fee_rate, slip_est, volatility_regime=vol_regime
+            )
             for a in actions:
                 # 액션 실행 직전 최신 포지션을 다시 읽음(중간에 WS가 제거했을 수 있음)
                 p = self.portfolio.positions.get(market)
@@ -1174,7 +1391,9 @@ class TradingStateMachine:
                     except Exception:
                         pass
 
-                    res = await self.exec_engine.execute_market(market, "SELL", val, qty, px, slip_est, a["reason"])
+                    res = await self.exec_engine.execute_market(
+                        market, "SELL", val, qty, px, slip_est, a["reason"]
+                    )
                 finally:
                     self._exit_inflight.discard(market)
 
@@ -1186,13 +1405,21 @@ class TradingStateMachine:
 
                     # 더스트 처리 쿨다운/최소주문금액 미만 등은 '오류'라기보다 정책적 스킵이므로
                     # order_errors/서킷브레이커에 반영하지 않습니다.
-                    is_dust_skip = r in {"dust_topup_cooldown", "live_under_min_notional"}
+                    is_dust_skip = r in {
+                        "dust_topup_cooldown",
+                        "live_under_min_notional",
+                    }
 
                     if not (is_stoploss_dust or is_dust_skip):
                         self.risk.stats.order_errors += 1
 
                     try:
-                        self.storage.log_event("WARN", "SELL_FAIL", market, f"reason={res.reason} action={a['reason']}")
+                        self.storage.log_event(
+                            "WARN",
+                            "SELL_FAIL",
+                            market,
+                            f"reason={res.reason} action={a['reason']}",
+                        )
                     except Exception:
                         pass
 
@@ -1238,8 +1465,12 @@ class TradingStateMachine:
                 pnl_quote = (res.fill_price - removed.entry_price) * qty - res.fee
                 pnl_value = pnl_quote * quote_krw
                 self.risk.update_realized(pnl_value)
-                
-                pnl_pct = (res.fill_price - removed.entry_price) / removed.entry_price if removed.entry_price > 0 else 0
+
+                pnl_pct = (
+                    (res.fill_price - removed.entry_price) / removed.entry_price
+                    if removed.entry_price > 0
+                    else 0
+                )
                 is_win = pnl_pct > 0
                 self.risk.update_trade_result(is_win, pnl_pct)
 
@@ -1253,7 +1484,9 @@ class TradingStateMachine:
         for m, p in self.portfolio.positions.items():
             last = last_prices.get(m, p.entry_price)
             fee_rate = float(self.cfg["fees"].get(m.split("-")[0], 0.001))
-            pnl = self.portfolio.net_pnl_pct(p, last, fee_rate, self.exec_engine.estimate_slippage(m, 0.001))
+            pnl = self.portfolio.net_pnl_pct(
+                p, last, fee_rate, self.exec_engine.estimate_slippage(m, 0.001)
+            )
             hold = (now_ms() - p.entry_ts_ms) // 1000
             self.storage.insert(
                 "positions",
@@ -1280,7 +1513,9 @@ class TradingStateMachine:
         if self.replacement_events and now_ms() - self.replacement_events[-1] < 60_000:
             return
 
-        worst_market, ok = self.portfolio.replacement_candidates({"score": new_signal.score}, last_prices, self.cfg["fees"])
+        worst_market, ok = self.portfolio.replacement_candidates(
+            {"score": new_signal.score}, last_prices, self.cfg["fees"]
+        )
         if not ok or not worst_market:
             return
 
@@ -1313,10 +1548,17 @@ class TradingStateMachine:
         except Exception:
             pass
 
-        res = await self.exec_engine.execute_market(worst_market, "SELL", val, qty, px, slip_est, "replacement_out")
+        res = await self.exec_engine.execute_market(
+            worst_market, "SELL", val, qty, px, slip_est, "replacement_out"
+        )
         if not res.ok:
             try:
-                self.storage.log_event("WARN", "SELL_FAIL", worst_market, f"reason={res.reason} action=replacement_out")
+                self.storage.log_event(
+                    "WARN",
+                    "SELL_FAIL",
+                    worst_market,
+                    f"reason={res.reason} action=replacement_out",
+                )
             except Exception:
                 pass
             self._record_order_error_and_maybe_pause(res.reason)
@@ -1349,8 +1591,24 @@ class TradingStateMachine:
             btc = [m for m in self.all_markets if m.startswith("BTC-")][:60]
             usdt = [m for m in self.all_markets if m.startswith("USDT-")][:60]
             markets = krw + btc + usdt
-            tickers = await self._call_with_retry(lambda: self.rest.get_tickers(markets), name="get_tickers") or []
+            tickers = (
+                await self._call_with_retry(
+                    lambda: self.rest.get_tickers(markets), name="get_tickers"
+                )
+                or []
+            )
             if not tickers:
+                if self.mode == "live":
+                    try:
+                        self.storage.log_event(
+                            "WARN",
+                            "TICKER_FETCH_FAIL",
+                            None,
+                            "skip_mock_tickers_in_live",
+                        )
+                    except Exception:
+                        pass
+                    return
                 tickers = self._mock_tickers(markets)
             await self.cache.seed_tickers(tickers)
         else:
@@ -1364,10 +1622,28 @@ class TradingStateMachine:
             btc_ob = [m for m in self.all_markets if m.startswith("BTC-")][:5]
             usdt_ob = [m for m in self.all_markets if m.startswith("USDT-")][:5]
             ob_markets = krw_ob + btc_ob + usdt_ob
-            orderbooks = await self._call_with_retry(lambda: self.rest.get_orderbook(ob_markets), name="get_orderbook") or []
+            orderbooks = (
+                await self._call_with_retry(
+                    lambda: self.rest.get_orderbook(ob_markets), name="get_orderbook"
+                )
+                or []
+            )
             if not orderbooks:
+                if self.mode == "live":
+                    try:
+                        self.storage.log_event(
+                            "WARN",
+                            "ORDERBOOK_FETCH_FAIL",
+                            None,
+                            "skip_mock_orderbook_in_live",
+                        )
+                    except Exception:
+                        pass
+                    return
                 # tickers가 비어도 mock orderbook 생성은 가능
-                orderbooks = self._mock_orderbooks(ob_markets, tickers or self._mock_tickers(ob_markets))
+                orderbooks = self._mock_orderbooks(
+                    ob_markets, tickers or self._mock_tickers(ob_markets)
+                )
             await self.cache.seed_orderbooks(orderbooks)
 
         # 실제 캔들 데이터 사용 - top10 마켓에 대해서만 실제 데이터 수집
@@ -1379,7 +1655,13 @@ class TradingStateMachine:
             self._last_candle_fetch_ms[m] = now
 
             # 신호엔진에서 EMA60 등 60개 이상이 필요하므로, 초기부터 충분한 길이로 받아옵니다.
-            candles = await self._call_with_retry(lambda: self.rest.get_candles_minutes(m, unit=1, count=120), name=f"get_candles_minutes:{m}") or []
+            candles = (
+                await self._call_with_retry(
+                    lambda: self.rest.get_candles_minutes(m, unit=1, count=120),
+                    name=f"get_candles_minutes:{m}",
+                )
+                or []
+            )
             if candles:
                 for c in reversed(candles):
                     # Upbit 분봉 응답에는 candle 시각이 포함됩니다.
@@ -1398,7 +1680,9 @@ class TradingStateMachine:
                         "close": float(c.get("trade_price", 0.0)),
                         # 내부/외부 호환을 위해 두 키 모두 유지
                         "volume": float(c.get("candle_acc_trade_volume", 0.0)),
-                        "candle_acc_trade_volume": float(c.get("candle_acc_trade_volume", 0.0)),
+                        "candle_acc_trade_volume": float(
+                            c.get("candle_acc_trade_volume", 0.0)
+                        ),
                         "notional": float(c.get("candle_acc_trade_price", 0.0)),
                     }
                     await self.cache.push_candle(m, candle)
@@ -1418,10 +1702,23 @@ class TradingStateMachine:
                         pass
                 self._last_candle_success_ms[m] = now_ms()
                 try:
-                    self.storage.log_event("INFO", "CANDLE_FETCH_OK", m, f"candles={len(candles)}")
+                    self.storage.log_event(
+                        "INFO", "CANDLE_FETCH_OK", m, f"candles={len(candles)}"
+                    )
                 except Exception:
                     pass
             else:
+                if self.mode == "live":
+                    try:
+                        self.storage.log_event(
+                            "WARN",
+                            "CANDLE_FETCH_FAIL",
+                            m,
+                            "skip_mock_candle_in_live",
+                        )
+                    except Exception:
+                        pass
+                    continue
                 # 실패 시에만 mock 데이터 사용
                 t = next((t for t in tickers if t["market"] == m), None)
                 if t:
@@ -1439,7 +1736,9 @@ class TradingStateMachine:
                         }
                         await self.cache.push_candle(m, c)
 
-    async def _call_with_retry(self, fn, *, name: str, retries: int = 3, base_delay_s: float = 0.4):
+    async def _call_with_retry(
+        self, fn, *, name: str, retries: int = 3, base_delay_s: float = 0.4
+    ):
         for attempt in range(1, retries + 1):
             try:
                 return await fn()
@@ -1448,19 +1747,27 @@ class TradingStateMachine:
                     LOGGER.warning("call failed after retries: %s err=%s", name, e)
                     return None
                 wait = min(5.0, base_delay_s * (2 ** (attempt - 1)))
-                LOGGER.warning("call failed: %s attempt=%d wait=%.2fs err=%s", name, attempt, wait, e)
+                LOGGER.warning(
+                    "call failed: %s attempt=%d wait=%.2fs err=%s",
+                    name,
+                    attempt,
+                    wait,
+                    e,
+                )
                 await asyncio.sleep(wait)
 
     def _mock_tickers(self, markets):
         out = []
         for m in markets:
             px = random.uniform(100, 150000)
-            out.append({
-                "market": m,
-                "trade_price": px,
-                "acc_trade_price_24h": random.uniform(1e8, 1e11),
-                "acc_trade_volume_24h": random.uniform(100, 1e7),
-            })
+            out.append(
+                {
+                    "market": m,
+                    "trade_price": px,
+                    "acc_trade_price_24h": random.uniform(1e8, 1e11),
+                    "acc_trade_volume_24h": random.uniform(100, 1e7),
+                }
+            )
         return out
 
     def _mock_orderbooks(self, markets, tickers):
@@ -1471,12 +1778,14 @@ class TradingStateMachine:
             units = []
             for i in range(3):
                 spread = 0.0002 + i * 0.0002
-                units.append({
-                    "ask_price": px * (1 + spread),
-                    "bid_price": px * (1 - spread),
-                    "ask_size": random.uniform(3, 80),
-                    "bid_size": random.uniform(3, 80),
-                })
+                units.append(
+                    {
+                        "ask_price": px * (1 + spread),
+                        "bid_price": px * (1 - spread),
+                        "ask_size": random.uniform(3, 80),
+                        "bid_size": random.uniform(3, 80),
+                    }
+                )
             out.append({"market": m, "orderbook_units": units})
         return out
 

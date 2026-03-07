@@ -1,9 +1,24 @@
 from dataclasses import dataclass
+from typing import Any
 from .indicators import (
-    rsi, sma, ema, macd, bollinger_bands, atr,
-    vwap, adx, stochastic_rsi, atr_percent, market_regime, volatility_regime,
-    rsi_divergence, candle_pattern, momentum_score,
-    order_flow_imbalance, liquidity_pressure, is_optimal_trading_time
+    rsi,
+    sma,
+    ema,
+    macd,
+    bollinger_bands,
+    atr,
+    vwap,
+    adx,
+    stochastic_rsi,
+    atr_percent,
+    market_regime,
+    volatility_regime,
+    rsi_divergence,
+    candle_pattern,
+    momentum_score,
+    order_flow_imbalance,
+    liquidity_pressure,
+    is_optimal_trading_time,
 )
 import logging
 
@@ -30,16 +45,57 @@ class Signal:
     market_regime_signal: str = "neutral"
     volatility_regime: str = "normal"
 
+
+def _trend_value(values: list[float], period: int) -> tuple[float | None, str]:
+    value = ema(values, period)
+    if value is not None:
+        return value, "EMA"
+
+    fallback = sma(values, period)
+    if fallback is not None:
+        return fallback, "SMA"
+
+    return None, "UNKNOWN"
+
+
+def _compute_adaptive_cutoff(
+    base_cutoff: int,
+    candles: list[dict[str, Any]],
+    atr_pct: float,
+) -> tuple[int, list[str]]:
+    vol_regime = volatility_regime(candles)
+    reasons: list[str] = []
+    dynamic_cutoff = base_cutoff
+
+    if vol_regime == "low":
+        dynamic_cutoff -= 5
+        reasons.append(f"LOW_VOL_REGIME(Cut{dynamic_cutoff})")
+    elif vol_regime == "high":
+        dynamic_cutoff += 5
+        reasons.append(f"HIGH_VOL_REGIME(Cut{dynamic_cutoff})")
+
+    if atr_pct < 0.5:
+        dynamic_cutoff = (
+            min(dynamic_cutoff, 65) if base_cutoff > 60 else min(dynamic_cutoff, 55)
+        )
+        reasons.append(f"LOW_ATR(Cut{dynamic_cutoff})")
+    elif atr_pct > 2.0:
+        dynamic_cutoff = max(dynamic_cutoff, 65)
+        reasons.append(f"HIGH_ATR(Cut{dynamic_cutoff})")
+
+    return dynamic_cutoff, reasons
+
+
 def build_signal_simple(
     market: str,
-    candles: list[dict],
+    candles: list[dict[str, Any]],
     notional_ratio: float,
     spread_pct: float,
     depth_ratio: float,
     btc_regime_ok: bool,
     notional_ratio_min: float,
     mtf_trend_ok: bool = True,
-    orderbook: dict | None = None,
+    orderbook: dict[str, Any] | None = None,
 ) -> Signal:
     """Simplified, lower-overfit entry model.
 
@@ -53,19 +109,42 @@ def build_signal_simple(
     """
 
     if len(candles) < 60:
-        return Signal(market, 0, False, 0, notional_ratio, spread_pct, depth_ratio, 0, btc_regime_ok, False, "candles < 60", 80)
+        return Signal(
+            market,
+            0,
+            False,
+            0,
+            notional_ratio,
+            spread_pct,
+            depth_ratio,
+            0,
+            btc_regime_ok,
+            False,
+            "candles < 60",
+            80,
+        )
 
     closes = [float(c["close"]) for c in candles]
-    volumes = [float(c.get("volume", c.get("candle_acc_trade_volume", 0.0)) or 0.0) for c in candles]
+    volumes = [
+        float(c.get("volume", c.get("candle_acc_trade_volume", 0.0)) or 0.0)
+        for c in candles
+    ]
     last_price = closes[-1]
 
     score = 0.0
     reasons: list[str] = []
 
-    # Trend: EMA alignment (core)
-    ema5 = ema(closes, 5)
-    ema20 = ema(closes, 20)
-    ema60 = ema(closes, 60)
+    ema5, ema5_src = _trend_value(closes, 5)
+    ema20, ema20_src = _trend_value(closes, 20)
+    ema60, ema60_src = _trend_value(closes, 60)
+
+    if ema5_src != "EMA" and ema5 is not None:
+        reasons.append(f"EMA5_FALLBACK_{ema5_src}")
+    if ema20_src != "EMA" and ema20 is not None:
+        reasons.append(f"EMA20_FALLBACK_{ema20_src}")
+    if ema60_src != "EMA" and ema60 is not None:
+        reasons.append(f"EMA60_FALLBACK_{ema60_src}")
+
     if ema5 and ema20 and ema60 and (ema5 > ema20 > ema60):
         score += 50
         reasons.append("EMA_GOLDEN")
@@ -131,7 +210,15 @@ def build_signal_simple(
     if "REJECT_RSI_HOT" in "/".join(reasons):
         strict_pass = False
 
-    dynamic_cutoff = 60  # simpler fixed threshold
+    atr_pct = atr_percent(candles, 14)
+    dynamic_cutoff = 60
+    adaptive_cutoff, adaptive_reasons = _compute_adaptive_cutoff(
+        dynamic_cutoff,
+        candles,
+        atr_pct,
+    )
+    reasons.extend(adaptive_reasons)
+    dynamic_cutoff = adaptive_cutoff
     tradable = strict_pass and (score >= dynamic_cutoff)
 
     return Signal(
@@ -153,26 +240,44 @@ def build_signal_simple(
 
 def build_signal(
     market: str,
-    candles: list[dict],
+    candles: list[dict[str, Any]],
     notional_ratio: float,
     spread_pct: float,
     depth_ratio: float,
     btc_regime_ok: bool,
     notional_ratio_min: float,
     mtf_trend_ok: bool = True,
-    orderbook: dict | None = None,
+    orderbook: dict[str, Any] | None = None,
 ) -> Signal:
     if len(candles) < 60:
-        LOGGER.warning(f"Insufficient candles for {market}: {len(candles)} < 60, returning zero signal")
-        return Signal(market, 0, False, 0, notional_ratio, spread_pct, depth_ratio, 0, btc_regime_ok, False, "candles < 60", 80)
+        LOGGER.warning(
+            f"Insufficient candles for {market}: {len(candles)} < 60, returning zero signal"
+        )
+        return Signal(
+            market,
+            0,
+            False,
+            0,
+            notional_ratio,
+            spread_pct,
+            depth_ratio,
+            0,
+            btc_regime_ok,
+            False,
+            "candles < 60",
+            80,
+        )
 
     closes = [float(c["close"]) for c in candles]
     # 캐시 캔들은 volume 키로 저장됩니다(Upbit 원본 키도 같이 넣어둘 수 있음)
-    volumes = [float(c.get("volume", c.get("candle_acc_trade_volume", 0.0)) or 0.0) for c in candles]
+    volumes = [
+        float(c.get("volume", c.get("candle_acc_trade_volume", 0.0)) or 0.0)
+        for c in candles
+    ]
     highs = [float(c["high"]) for c in candles]
     lows = [float(c["low"]) for c in candles]
     last_price = closes[-1]
-    
+
     # ---------------------------------------------------------
     # Phase 2: Composite Strategy (종합 점수제)
     # 총점 100점 만점
@@ -182,15 +287,22 @@ def build_signal(
 
     # 1. [Trend] EMA 정배열 (Golden Cross) - 30점
     # 5일선 > 20일선 > 60일선 (단기 급등 추세 확인)
-    ema5 = ema(closes, 5)
-    ema20 = ema(closes, 20)
-    ema60 = ema(closes, 60)
-    
+    ema5, ema5_src = _trend_value(closes, 5)
+    ema20, ema20_src = _trend_value(closes, 20)
+    ema60, ema60_src = _trend_value(closes, 60)
+
+    if ema5_src != "EMA" and ema5 is not None:
+        reasons.append(f"EMA5_FALLBACK_{ema5_src}")
+    if ema20_src != "EMA" and ema20 is not None:
+        reasons.append(f"EMA20_FALLBACK_{ema20_src}")
+    if ema60_src != "EMA" and ema60 is not None:
+        reasons.append(f"EMA60_FALLBACK_{ema60_src}")
+
     if ema5 and ema20 and ema60:
         if ema5 > ema20 > ema60:
             score += 30
             reasons.append("EMA_GOLDEN")
-        elif ema5 > ema20: # 최소한 단기는 정배열이어야 함
+        elif ema5 > ema20:  # 최소한 단기는 정배열이어야 함
             score += 15
             reasons.append("EMA_SHORT_UP")
 
@@ -221,7 +333,7 @@ def build_signal(
     # 4. [Confirmation] MACD Bullish - 10점
     macd_line, macd_sig, macd_hist = macd(closes)
     _, _, prev_hist = macd(closes[:-1])
-    
+
     if macd_hist > 0 and macd_hist > prev_hist:
         score += 10
         reasons.append("MACD_ACCEL")
@@ -239,32 +351,32 @@ def build_signal(
     elif rsi_val < 40:
         score -= 20
         reasons.append("RSI_WEAK")
-    
+
     if rsi_fast < 35:
         score += 5
         reasons.append(f"RSI_FAST_OS({rsi_fast:.0f})")
 
     # 6. [NEW] RSI Divergence Detection
     rsi_div = rsi_divergence(candles)
-    if rsi_div == 'bullish':
+    if rsi_div == "bullish":
         score += 10
         reasons.append("RSI_DIV_BULL")
-    elif rsi_div == 'bearish':
+    elif rsi_div == "bearish":
         score -= 10
         reasons.append("RSI_DIV_BEAR")
 
     # 7. [NEW] Candle Pattern Recognition
     pattern = candle_pattern(candles)
-    if pattern == 'hammer':
+    if pattern == "hammer":
         score += 10
         reasons.append("HAMMER")
-    elif pattern == 'bullish_engulfing':
+    elif pattern == "bullish_engulfing":
         score += 10
         reasons.append("ENGULF_BULL")
-    elif pattern == 'shooting_star':
+    elif pattern == "shooting_star":
         score -= 10
         reasons.append("SHOOTING_STAR")
-    elif pattern == 'bearish_engulfing':
+    elif pattern == "bearish_engulfing":
         score -= 10
         reasons.append("ENGULF_BEAR")
 
@@ -283,7 +395,7 @@ def build_signal(
         vwap_distance = (last_price - vwap_val) / vwap_val
         if vwap_distance < -0.002:
             score += 15
-            reasons.append(f"VWAP_ABOVE({vwap_distance*100:.1f}%)")
+            reasons.append(f"VWAP_ABOVE({vwap_distance * 100:.1f}%)")
         elif vwap_distance > 0.002:
             score += 5
 
@@ -310,31 +422,31 @@ def build_signal(
         reasons.append(f"STOCH_OB({stoch_k:.0f})")
 
     atr_pct = atr_percent(candles, 14)
-    
+
     regime = market_regime(candles)
     vol_regime = volatility_regime(candles)
-    market_regime_signal = regime['signal']
-    
+    market_regime_signal = regime["signal"]
+
     dynamic_cutoff = 75
-    
-    if atr_pct < 0.5:
-        dynamic_cutoff = 65
-        reasons.append(f"LOW_VOL(Cut{dynamic_cutoff})")
-    elif atr_pct > 2.0:
-        dynamic_cutoff = 80
-        reasons.append(f"HIGH_VOL(Cut{dynamic_cutoff})")
-    
-    if market_regime_signal == 'favorable':
+    adaptive_cutoff, adaptive_reasons = _compute_adaptive_cutoff(
+        dynamic_cutoff,
+        candles,
+        atr_pct,
+    )
+    reasons.extend(adaptive_reasons)
+    dynamic_cutoff = adaptive_cutoff
+
+    if market_regime_signal == "favorable":
         score += 10
         reasons.append(f"REGIME_FAVORABLE({regime['trend']})")
-    elif market_regime_signal == 'unfavorable':
+    elif market_regime_signal == "unfavorable":
         score -= 10
         reasons.append(f"REGIME_UNFAVORABLE({regime['volatility']})")
-    
-    if vol_regime == 'high':
+
+    if vol_regime == "high":
         score -= 5
         reasons.append("HIGH_VOLATILITY")
-    elif vol_regime == 'low':
+    elif vol_regime == "low":
         score += 5
         reasons.append("LOW_VOLATILITY")
 
@@ -350,10 +462,10 @@ def build_signal(
 
     # 10. [NEW] Liquidity Pressure Detection
     liq_pressure = liquidity_pressure(candles)
-    if liq_pressure == 'liquidity_grab_down':
+    if liq_pressure == "liquidity_grab_down":
         score += 10
         reasons.append("LIQ_GRAB_DOWN")
-    elif liq_pressure == 'liquidity_grab_up':
+    elif liq_pressure == "liquidity_grab_up":
         score -= 10
         reasons.append("LIQ_GRAB_UP")
 
@@ -363,7 +475,7 @@ def build_signal(
         reasons.append("OFF_HOURS")
 
     strict_pass = True
-    
+
     # A. 윗꼬리 금지 (상승하다 처박는 중이면 절대 진입 금지)
     op = float(candles[-1]["open"])
     hi = float(candles[-1]["high"])
@@ -371,7 +483,7 @@ def build_signal(
     cl = float(candles[-1]["close"])
     body = abs(cl - op)
     upper_wick = hi - max(cl, op)
-    
+
     # 윗꼬리가 몸통보다 2배 이상 길면 탈락 (매도세 출현)
     if body > 0 and upper_wick > body * 2.5:
         strict_pass = False
@@ -406,15 +518,16 @@ def build_signal(
         reasons.append("REJECT_TREND_DOWN")
 
     exec_score = 0
-    if spread_pct <= 0.002: exec_score = 10
-    
+    if spread_pct <= 0.002:
+        exec_score = 10
+
     final_score = score + exec_score
-    
+
     # 진입 기준점: 동적 컷오프 적용
     is_buy = strict_pass and (final_score >= dynamic_cutoff)
 
     note = "/".join(reasons)
-    
+
     return Signal(
         market=market,
         score=final_score,

@@ -5,7 +5,16 @@ from src.risk import RiskManager
 
 
 def _c(ts_ms: int, o: float, h: float, l: float, c: float, v: float):
-    return {"ts_ms": ts_ms, "timestamp": ts_ms / 1000, "open": o, "high": h, "low": l, "close": c, "volume": v, "value": c * v}
+    return {
+        "ts_ms": ts_ms,
+        "timestamp": ts_ms / 1000,
+        "open": o,
+        "high": h,
+        "low": l,
+        "close": c,
+        "volume": v,
+        "value": c * v,
+    }
 
 
 def _make_uptrend_candles(n: int = 120, base_price: float = 100.0):
@@ -13,7 +22,9 @@ def _make_uptrend_candles(n: int = 120, base_price: float = 100.0):
     px = base_price
     for i in range(n):
         px *= 1.0008
-        candles.append(_c(0 + i * 60_000, px * 0.999, px * 1.002, px * 0.998, px, 100.0))
+        candles.append(
+            _c(0 + i * 60_000, px * 0.999, px * 1.002, px * 0.998, px, 100.0)
+        )
     return candles
 
 
@@ -22,13 +33,16 @@ def _make_downtrend_candles(n: int = 120, base_price: float = 100.0):
     px = base_price
     for i in range(n):
         px *= 0.9992
-        candles.append(_c(0 + i * 60_000, px * 1.001, px * 1.002, px * 0.998, px, 100.0))
+        candles.append(
+            _c(0 + i * 60_000, px * 1.001, px * 1.002, px * 0.998, px, 100.0)
+        )
     return candles
 
 
 def _make_sideways_candles(n: int = 120, base_price: float = 100.0):
     candles = []
     import random
+
     random.seed(42)
     px = base_price
     for i in range(n):
@@ -117,13 +131,24 @@ class TestSignalProfitability:
 class TestPortfolioProfitability:
     def test_profitable_position_evaluation(self):
         cfg = {
-            "stops": {"tp_net_pnl_pct": 0.02, "tp1_ratio": 0.5, "trailing_stop_pct": 0.015, "tp2_ratio": 0.3},
-            "time_rules": {"hard_exit_minutes": 60, "soft_cut_minutes": 20, "soft_cut_progress": 0.02},
+            "stops": {
+                "tp_net_pnl_pct": 0.02,
+                "tp1_ratio": 0.5,
+                "trailing_stop_pct": 0.015,
+                "tp2_ratio": 0.3,
+            },
+            "time_rules": {
+                "hard_exit_minutes": 60,
+                "soft_cut_minutes": 20,
+                "soft_cut_progress": 0.02,
+            },
             "replace": {"score_gap_min": 12},
         }
         pf = Portfolio(cfg)
         entry_price = 10000.0
-        pf.add("KRW-BTC", qty=1.0, entry_price=entry_price, stop_price=9800.0, score=80.0)
+        pf.add(
+            "KRW-BTC", qty=1.0, entry_price=entry_price, stop_price=9800.0, score=80.0
+        )
         current_price = 10500.0
         actions = pf.evaluate_exits("KRW-BTC", current_price, 0.0005, 0.001)
         assert len(actions) > 0
@@ -131,15 +156,27 @@ class TestPortfolioProfitability:
 
     def test_stop_loss_trigger(self):
         cfg = {
-            "stops": {"tp_net_pnl_pct": 0.02, "tp1_ratio": 0.5, "trailing_stop_pct": 0.015, "tp2_ratio": 0.3},
-            "time_rules": {"hard_exit_minutes": 60, "soft_cut_minutes": 20, "soft_cut_progress": 0.02},
+            "stops": {
+                "tp_net_pnl_pct": 0.02,
+                "tp1_ratio": 0.5,
+                "trailing_stop_pct": 0.015,
+                "tp2_ratio": 0.3,
+            },
+            "time_rules": {
+                "hard_exit_minutes": 60,
+                "soft_cut_minutes": 20,
+                "soft_cut_progress": 0.02,
+            },
             "replace": {"score_gap_min": 12},
         }
         pf = Portfolio(cfg)
         entry_price = 10000.0
-        pf.add("KRW-ETH", qty=1.0, entry_price=entry_price, stop_price=9900.0, score=80.0)
+        pf.add(
+            "KRW-ETH", qty=1.0, entry_price=entry_price, stop_price=9900.0, score=80.0
+        )
         current_price = 9890.0
         import time
+
         pf.positions["KRW-ETH"].entry_ts_ms = int(time.time() * 1000) - 120 * 1000
         actions = pf.evaluate_exits("KRW-ETH", current_price, 0.0005, 0.001)
         assert len(actions) > 0
@@ -147,15 +184,27 @@ class TestPortfolioProfitability:
 
     def test_breakeven_stop_moves_up(self):
         cfg = {
-            "stops": {"tp_net_pnl_pct": 0.02, "tp1_ratio": 0.5, "trailing_stop_pct": 0.015, "tp2_ratio": 0.3},
-            "time_rules": {"hard_exit_minutes": 60, "soft_cut_minutes": 20, "soft_cut_progress": 0.02},
+            "stops": {
+                "tp_net_pnl_pct": 0.02,
+                "tp1_ratio": 0.5,
+                "trailing_stop_pct": 0.015,
+                "tp2_ratio": 0.3,
+            },
+            "time_rules": {
+                "hard_exit_minutes": 60,
+                "soft_cut_minutes": 20,
+                "soft_cut_progress": 0.02,
+            },
             "replace": {"score_gap_min": 12},
         }
         pf = Portfolio(cfg)
         entry_price = 10000.0
-        pf.add("KRW-ADA", qty=1.0, entry_price=entry_price, stop_price=9900.0, score=80.0)
+        pf.add(
+            "KRW-ADA", qty=1.0, entry_price=entry_price, stop_price=9900.0, score=80.0
+        )
         pf.mark_peak("KRW-ADA", 10200.0)
         import time
+
         pf.positions["KRW-ADA"].entry_ts_ms = int(time.time() * 1000) - 120 * 1000
         pf.positions["KRW-ADA"].tp1_done = True
         current_price = 10200.0
@@ -173,7 +222,11 @@ class TestRiskManagementProfitability:
                 "max_positions": 10,
                 "total_exposure_cap": 0.70,
                 "per_coin_exposure_cap": 0.12,
-                "promote_requirements": {"min_trades": 5, "max_order_error_rate": 0.1, "max_avg_entry_slippage": 0.01},
+                "promote_requirements": {
+                    "min_trades": 5,
+                    "max_order_error_rate": 0.1,
+                    "max_avg_entry_slippage": 0.01,
+                },
             },
             "min_notional_krw": 5000,
         }
@@ -192,7 +245,11 @@ class TestRiskManagementProfitability:
                 "max_positions": 10,
                 "total_exposure_cap": 0.70,
                 "per_coin_exposure_cap": 0.12,
-                "promote_requirements": {"min_trades": 5, "max_order_error_rate": 0.1, "max_avg_entry_slippage": 0.01},
+                "promote_requirements": {
+                    "min_trades": 5,
+                    "max_order_error_rate": 0.1,
+                    "max_avg_entry_slippage": 0.01,
+                },
             },
             "min_notional_krw": 5000,
         }
@@ -211,7 +268,11 @@ class TestRiskManagementProfitability:
                 "max_positions": 10,
                 "total_exposure_cap": 0.70,
                 "per_coin_exposure_cap": 0.12,
-                "promote_requirements": {"min_trades": 5, "max_order_error_rate": 0.1, "max_avg_entry_slippage": 0.01},
+                "promote_requirements": {
+                    "min_trades": 5,
+                    "max_order_error_rate": 0.1,
+                    "max_avg_entry_slippage": 0.01,
+                },
             },
             "min_notional_krw": 5000,
         }
@@ -224,8 +285,17 @@ class TestRiskManagementProfitability:
 class TestStrategyProfitability:
     def test_profitable_scenario_simulation(self):
         cfg = {
-            "stops": {"tp_net_pnl_pct": 0.01, "tp1_ratio": 0.5, "trailing_stop_pct": 0.01, "tp2_ratio": 0.3},
-            "time_rules": {"hard_exit_minutes": 60, "soft_cut_minutes": 20, "soft_cut_progress": 0.02},
+            "stops": {
+                "tp_net_pnl_pct": 0.01,
+                "tp1_ratio": 0.5,
+                "trailing_stop_pct": 0.01,
+                "tp2_ratio": 0.3,
+            },
+            "time_rules": {
+                "hard_exit_minutes": 60,
+                "soft_cut_minutes": 20,
+                "soft_cut_progress": 0.02,
+            },
             "replace": {"score_gap_min": 12},
             "risk": {
                 "risk_per_trade_start": 0.001,
@@ -234,42 +304,58 @@ class TestStrategyProfitability:
                 "max_positions": 10,
                 "total_exposure_cap": 0.70,
                 "per_coin_exposure_cap": 0.12,
-                "promote_requirements": {"min_trades": 5, "max_order_error_rate": 0.1, "max_avg_entry_slippage": 0.01},
+                "promote_requirements": {
+                    "min_trades": 5,
+                    "max_order_error_rate": 0.1,
+                    "max_avg_entry_slippage": 0.01,
+                },
             },
             "min_notional_krw": 5000,
         }
         pf = Portfolio(cfg)
-        
+
         wins = 0
         total_trades = 0
-        
+
         import time
-        
+
         for i in range(20):
             entry_price = 10000.0
-            pf.add(f"KRW-COIN{i}", qty=1.0, entry_price=entry_price, stop_price=entry_price * 0.98, score=80.0)
-            pf.positions[f"KRW-COIN{i}"].entry_ts_ms = int(time.time() * 1000) - 120 * 1000
-            
+            pf.add(
+                f"KRW-COIN{i}",
+                qty=1.0,
+                entry_price=entry_price,
+                stop_price=entry_price * 0.98,
+                score=80.0,
+            )
+            pf.positions[f"KRW-COIN{i}"].entry_ts_ms = (
+                int(time.time() * 1000) - 120 * 1000
+            )
+
             if i % 2 == 0:
                 current_price = entry_price * 1.02
-                actions = pf.evaluate_exits(f"KRW-COIN{i}", current_price, 0.0005, 0.001)
+                actions = pf.evaluate_exits(
+                    f"KRW-COIN{i}", current_price, 0.0005, 0.001
+                )
                 if actions:
                     wins += 1
                 total_trades += 1
             else:
                 current_price = entry_price * 0.97
-                actions = pf.evaluate_exits(f"KRW-COIN{i}", current_price, 0.0005, 0.001)
+                actions = pf.evaluate_exits(
+                    f"KRW-COIN{i}", current_price, 0.0005, 0.001
+                )
                 if actions:
                     wins += 1
                 total_trades += 1
-        
+
         assert total_trades > 0, "Should have some trades"
 
 
 class TestSimpleSignalProfile:
     def test_simple_profile_faster_and_selective(self):
         candles = _make_uptrend_candles()
-        
+
         full_sig = build_signal(
             market="KRW-FULL",
             candles=candles,
@@ -280,7 +366,7 @@ class TestSimpleSignalProfile:
             notional_ratio_min=0.9,
             mtf_trend_ok=True,
         )
-        
+
         simple_sig = build_signal_simple(
             market="KRW-SIMPLE",
             candles=candles,
@@ -291,6 +377,6 @@ class TestSimpleSignalProfile:
             notional_ratio_min=0.9,
             mtf_trend_ok=True,
         )
-        
-        assert simple_sig.dynamic_cutoff == 60
-        assert full_sig.dynamic_cutoff >= 60
+
+        assert 55 <= simple_sig.dynamic_cutoff <= 80
+        assert full_sig.dynamic_cutoff >= simple_sig.dynamic_cutoff

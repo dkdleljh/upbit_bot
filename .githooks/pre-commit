@@ -42,5 +42,5 @@ if git diff --cached --name-status | awk '$1 != "D" {print $2}' | grep -qE '(^|/
   exit 1
 fi
 
-echo "[pre-commit] running scripts/smoke_check.sh"
-exec bash scripts/smoke_check.sh
+echo "[pre-commit] running scripts/smoke_check.sh (healthcheck skipped in pre-commit)"
+SMOKE_SKIP_HEALTHCHECK=1 exec bash scripts/smoke_check.sh

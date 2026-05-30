@@ -15,10 +15,14 @@ if git remote get-url origin >/dev/null 2>&1; then
   git pull --rebase --autostash || true
 fi
 
-# Lightweight secret scan (best-effort)
+# Lightweight secret scan (best-effort). Scan only files Git would actually
+# sync, and avoid matching this script's own regex.
 if command -v rg >/dev/null 2>&1; then
+  scan_files="$(mktemp)"
+  trap 'rm -f "$scan_files"' EXIT
+  git ls-files -co --exclude-standard | rg -v '^(scripts/auto_sync\.sh|.*\.env\.example)$' >"$scan_files" || true
   # Avoid matching placeholder env var names like UPBIT_ACCESS_KEY; scan for generic secrets only.
-  if rg -n "(-----BEGIN |AKIA[0-9A-Z]{16}|gho_[A-Za-z0-9]{20,})" -S --hidden --glob '!.git/**' --glob '!venv/**' --glob '!node_modules/**' >/dev/null 2>&1; then
+  if [ -s "$scan_files" ] && xargs -r -d '\n' rg -n "(-----BEGIN |AKIA[0-9A-Z]{16}|gho_[A-Za-z0-9]{20,})" -S --hidden <"$scan_files" >/dev/null 2>&1; then
     echo "[auto_sync] ERROR: potential secret detected by regex scan" >&2
     exit 3
   fi

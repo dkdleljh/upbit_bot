@@ -78,3 +78,11 @@ python -m src.main --health
 - `logs/` : 실행 로그
 - `data/trading_bot.db` : SQLite
 - `reports/` : 리포트
+
+<!-- BEGIN RELEASE STATUS -->
+## 최신 배포 정보
+
+- 저장소 버전: `v2026.10.10.1`
+- [변경사항과 검증 범위](RELEASE_NOTES.md)
+- [GitHub 릴리즈](https://github.com/dkdleljh/upbit_bot/releases/latest)
+<!-- END RELEASE STATUS -->

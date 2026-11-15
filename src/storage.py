@@ -1,4 +1,6 @@
 import csv
+import json
+import time
 import logging
 import sqlite3
 from pathlib import Path
@@ -21,6 +23,25 @@ class Storage:
 
     def _create_tables(self) -> None:
         ddl = [
+            """
+            CREATE TABLE IF NOT EXISTS order_intents (
+                identifier TEXT PRIMARY KEY,
+                market TEXT NOT NULL,
+                side TEXT NOT NULL,
+                request_json TEXT NOT NULL,
+                uuid TEXT,
+                status TEXT NOT NULL,
+                detail_json TEXT,
+                acknowledged INTEGER NOT NULL DEFAULT 0,
+                created_ms INTEGER NOT NULL,
+                updated_ms INTEGER NOT NULL
+            )
+            """,
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS ux_pending_order_asset
+            ON order_intents(substr(market, instr(market, '-') + 1))
+            WHERE acknowledged=0
+            """,
             """
             CREATE TABLE IF NOT EXISTS candles (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -187,6 +208,40 @@ class Storage:
 
             # equity_snapshots는 신규 테이블이므로 별도 ALTER은 불필요(테이블 생성만)
 
+    def pending_orders(self, market=None):
+        rows = self.query("SELECT * FROM order_intents WHERE acknowledged=0 ORDER BY created_ms")
+        # An unresolved base asset is blocked across KRW/BTC/USDT routes too.
+        if market is not None:
+            base = market.split("-", 1)[-1]
+            rows = [r for r in rows if r["market"].split("-", 1)[-1] == base]
+        return rows
+
+    def prepare_order(self, body):
+        ts = int(time.time() * 1000)
+        with self.lock, self.conn:
+            rows = self.conn.execute("SELECT market FROM order_intents WHERE acknowledged=0").fetchall()
+            base = body["market"].split("-", 1)[-1]
+            if any(r["market"].split("-", 1)[-1] == base for r in rows):
+                raise RuntimeError("unresolved_order")
+            self.conn.execute(
+                "INSERT INTO order_intents(identifier,market,side,request_json,status,created_ms,updated_ms) "
+                "VALUES(?,?,?,?,?,?,?)",
+                (body["identifier"], body["market"], body["side"], json.dumps(body), "prepared", ts, ts),
+            )
+
+    def update_order(self, identifier, detail, status=None, acknowledged=None):
+        self.execute(
+            "UPDATE order_intents SET uuid=COALESCE(?,uuid), status=?, detail_json=?, "
+            "acknowledged=COALESCE(?,acknowledged), updated_ms=? WHERE identifier=?",
+            (detail.get("uuid"), status or detail.get("state", "unknown"), json.dumps(detail),
+             None if acknowledged is None else int(acknowledged), int(time.time() * 1000), identifier),
+        )
+
+    def acknowledge_order(self, order_uuid):
+        # Only terminal orders whose fills were recorded by the executor may be released.
+        self.execute("UPDATE order_intents SET acknowledged=1 WHERE uuid=? AND status IN ('done','cancel')",
+                     (order_uuid,))
+
     def insert(self, table: str, data: dict) -> None:
         cols = ",".join(data.keys())
         placeholders = ",".join(["?"] * len(data))
@@ -271,3 +326,4 @@ class Storage:
     def close(self) -> None:
         with self.lock:
             self.conn.close()
+

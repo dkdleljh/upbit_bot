@@ -248,3 +248,15 @@ notifications:
   notify_on_circuit_breaker: true
   # Notify daily summary
   notify_on_daily_summary: true
+
+
+# Execution safety only; strategy scores and entry/exit thresholds are unchanged.
+market_safety:
+  blocked_buy_assets: [SOPH, ZIL]
+  trading_ends_at:
+    SOPH: "2026-11-16T15:00:00+09:00"
+    ZIL: "2026-11-16T15:00:00+09:00"
+  catalog_refresh_seconds: 60
+  catalog_max_age_seconds: 120
+  quote_max_age_seconds: 90
+  candle_max_age_seconds: 180

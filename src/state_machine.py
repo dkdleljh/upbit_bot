@@ -89,8 +89,12 @@ class TradingStateMachine:
         self.risk = risk_manager
         self.reporter = reporter
         self.mode = mode
+        self._last_catalog_refresh_ms = 0
+        self._last_reconcile_ms = 0
         self.exec_engine = ExecutionEngine(cfg, storage, mode, rest_client=rest_client)
         self.portfolio = Portfolio(cfg)
+        if hasattr(self.rest, "entry_guard"):
+            self.rest.entry_guard = lambda: not self.safe_mode and now_ms() >= self._entry_pause_until_ms
         self.ws = None  # WS 초기화는 initialize에서
 
         # WS 이벤트 폭주 방지: 콜백에서 태스크를 만들지 않고 큐로 넘겨 단일 소비자가 처리
@@ -155,18 +159,35 @@ class TradingStateMachine:
             self._market_locks[market] = lock
         return lock
 
-    async def initialize(self):
-        # 0) 마켓 목록 확보
+    def _policy_allows(self, market, side="BUY", require_data=False):
+        policy = getattr(self.rest, "policy", None)
+        return policy is not None and policy.reason(market, side, require_data) is None
+
+    def _subscription_markets(self):
+        return sorted(m for m in set(self.universe_top10) | set(self.portfolio.positions)
+                      if self._policy_allows(m, "SELL"))
+
+    async def _refresh_market_catalog(self, force=False):
+        now = now_ms()
+        interval = float(self.cfg.get("market_safety", {}).get("catalog_refresh_seconds", 60)) * 1000
+        if not force and now - self._last_catalog_refresh_ms < interval:
+            return
+        self._last_catalog_refresh_ms = now
         try:
-            self.all_markets = (
-                await self._call_with_retry(
-                    lambda: self.rest.get_markets(), name="get_markets_init"
-                )
-                or []
-            )
-        except Exception as e:
-            LOGGER.warning("get_markets failed: %s", e)
-            self.all_markets = []
+            markets = await self.rest.get_markets()
+            self.all_markets = [m for m in markets if self._policy_allows(m, "SELL")]
+            self.cache.prune(self.all_markets)
+            self.universe_top10 = [m for m in self.universe_top10 if self._policy_allows(m)]
+        except Exception as exc:
+            if hasattr(self.rest, "policy"):
+                self.rest.policy.catalog_ok = False
+            self.universe_top10 = []
+            self.storage.log_event("ERROR", "MARKET_CATALOG_UNAVAILABLE", None, type(exc).__name__)
+
+    async def initialize(self):
+        await self._refresh_market_catalog(force=True)
+        if self.mode == "live" and getattr(self.rest, "is_live_ready", False):
+            await self.rest.reconcile_pending_orders()
 
         # 1) 초기 캐시 시드 (tickers/orderbook)
         # - tickers가 비어있으면 유니버스를 절대 만들 수 없어서 top10=0이 됩니다.
@@ -243,7 +264,7 @@ class TradingStateMachine:
                 await self._cycle()
 
                 # 구독 목록 변경 감지 시 WS 재구독
-                if self.ws and set(self.ws.markets) != set(self.universe_top10):
+                if self.ws and set(self.ws.markets) != set(self._subscription_markets()):
                     LOGGER.info("유니버스 변경으로 WS 재구독...")
                     await self.ws.stop()
                     try:
@@ -252,7 +273,7 @@ class TradingStateMachine:
                         )
                     except Exception:
                         pass
-                    self.ws.markets = list(self.universe_top10)
+                    self.ws.markets = self._subscription_markets()
                     await self.ws.start()
                     try:
                         self.storage.log_event(
@@ -343,7 +364,19 @@ class TradingStateMachine:
         if not code:
             return
 
+        if not self._policy_allows(code, "SELL") or not self.cache._recent(
+            data, float(self.cfg.get("market_safety", {}).get("quote_max_age_seconds", 90))
+        ):
+            return
+        if ty == "orderbook":
+            row = dict(data, market=code)
+            await self.cache.seed_orderbooks([row])
+            self.rest.policy.record_data(code, "orderbook", row)
+            return
         if ty == "ticker":
+            row = dict(data, market=code)
+            await self.cache.seed_tickers([row])
+            self.rest.policy.record_data(code, "ticker", row)
             # 1. 시세 업데이트 (캐시 갱신)
             # WS 데이터 포맷 -> Cache 포맷 변환 필요
             # 여기서는 간단히 trade_price만 갱신한다고 가정
@@ -401,8 +434,7 @@ class TradingStateMachine:
             # 1. Stop Loss 체크 (가장 급함)
             if current_price <= p.stop_price:
                 self._exit_inflight.add(market)
-                # 중복 매도 방지: await 전에 포지션을 먼저 제거
-                p = self.portfolio.remove(market) or p
+                # Inflight + execution lock prevent duplicates; retain unfilled inventory.
                 try:
                     # 시장가로 즉시 던짐
                     try:
@@ -437,6 +469,9 @@ class TradingStateMachine:
                         except Exception:
                             pass
                     else:
+                        p.qty = max(0.0, p.qty - res.qty)
+                        if p.qty <= 1e-12:
+                            self.portfolio.remove(market)
                         try:
                             self.storage.log_event(
                                 "INFO",
@@ -523,6 +558,12 @@ class TradingStateMachine:
         now = now_ms()
 
         self.risk.roll_daily()
+        await self._refresh_market_catalog()
+        if self.mode == "live" and getattr(self.rest, "is_live_ready", False):
+            if now - self._last_reconcile_ms >= 60_000:
+                self._last_reconcile_ms = now
+                await self.rest.reconcile_pending_orders()
+            self.rest.recover_error_count(float(self.cfg.get("live", {}).get("safe_mode_recover_seconds", 900)))
 
         # live 모드에서만 safe_mode 발동 (paper 모드는 공용 API 429로 인한 진입 차단 방지)
         if (
@@ -623,7 +664,7 @@ class TradingStateMachine:
         await self.refresh_universe()
 
         btc_ok = await self._btc_regime_ok()
-        tickers, orderbooks = await self.cache.snapshot()
+        tickers, orderbooks = await self._quote_snapshot()
         last_prices = {m: float(t.get("trade_price", 0.0)) for m, t in tickers.items()}
 
         # 5분봉 데이터(MTF) 조회 - Top10 종목 대상
@@ -653,6 +694,10 @@ class TradingStateMachine:
             candles = await self.cache.get_candles(m)
             ob = orderbooks.get(m)
             if not candles or not ob:
+                continue
+            if self.mode == "live" and (not self._policy_allows(m, require_data=True) or
+                not 0 <= now_ms() - candles[-1].get("ts_ms", 0) <=
+                float(self.cfg.get("market_safety", {}).get("candle_max_age_seconds", 180)) * 1000):
                 continue
 
             spread_pct = self.exec_engine._spread_pct(ob)
@@ -708,6 +753,12 @@ class TradingStateMachine:
         await self._process_entries(signals, last_prices, orderbooks)
         await self._snapshot_positions(last_prices)
 
+    async def _quote_snapshot(self):
+        if self.mode == "live":
+            return await self.cache.fresh_snapshot(
+                float(self.cfg.get("market_safety", {}).get("quote_max_age_seconds", 90)))
+        return await self.cache.snapshot()
+
     async def refresh_universe(self, force: bool = False):
         now = now_ms()
         if (
@@ -717,8 +768,8 @@ class TradingStateMachine:
         ):
             return
 
-        tickers, orderbooks = await self.cache.snapshot()
-        tickers_list = list(tickers.values())
+        tickers, orderbooks = await self._quote_snapshot()
+        tickers_list = [t for m, t in tickers.items() if self._policy_allows(m)]
 
         # 1) tickers로 top30 후보만 계산 (orderbook 없이)
         top30_candidates, _, _ = select_universe(
@@ -806,7 +857,7 @@ class TradingStateMachine:
             try:
                 bal = float(a.get("balance") or 0.0)
                 locked = float(a.get("locked") or 0.0)
-                qty = max(0.0, bal - locked)
+                qty = max(0.0, bal + locked)
                 avg = float(a.get("avg_buy_price") or 0.0)
             except Exception:
                 continue
@@ -819,6 +870,8 @@ class TradingStateMachine:
 
         # 1) 내부 포지션 중 실보유가 없으면 제거 / qty를 실보유로 보정
         for m in list(self.portfolio.positions.keys()):
+            if self.storage.pending_orders(m) or not self._policy_allows(m, "SELL"):
+                continue  # unresolved/ended assets retain position ownership for review
             base = m.split("-")[1] if "-" in m else ""
             info = actual.get(base)
             if not info:
@@ -1084,6 +1137,8 @@ class TradingStateMachine:
 
         for s in tradables[:5]:  # 상위 5개까지만 검토
             market = s.market
+            if not self._policy_allows(market, require_data=self.mode == "live"):
+                continue
             # 마켓 격리/쿨다운(WS 손절 등) 중이면 진입 금지
             if self.exec_engine.is_cooldown(market):
                 continue
@@ -1340,6 +1395,9 @@ class TradingStateMachine:
             # WS 손절과 동시에 청산 루프가 돌면 중복 매도가 날 수 있어 가드
             if market in self._exit_inflight:
                 continue
+            if self.mode == "live" and (market not in last_prices or
+                    not self._policy_allows(market, "SELL", require_data=True)):
+                continue
 
             # 기본은 ticker 기반 현재가
             px_ticker = last_prices.get(market, p0.entry_price)
@@ -1437,8 +1495,8 @@ class TradingStateMachine:
                             pass
 
                     # 실패했고 전량청산으로 이미 제거했으면 복구
-                    # 단, 손절 더스트는 반복 루프 방지를 위해 복구하지 않습니다.
-                    if a["ratio"] >= 0.999 and not is_stoploss_dust:
+                    # 차단/부분 체결/더스트도 미매도 보유 수량을 보존합니다.
+                    if a["ratio"] >= 0.999:
                         self.portfolio.positions[market] = removed
                     continue
 
@@ -1462,7 +1520,7 @@ class TradingStateMachine:
                 if quote_krw <= 0:
                     quote_krw = 1.0
 
-                pnl_quote = (res.fill_price - removed.entry_price) * qty - res.fee
+                pnl_quote = (res.fill_price - removed.entry_price) * res.qty - res.fee
                 pnl_value = pnl_quote * quote_krw
                 self.risk.update_realized(pnl_value)
 
@@ -1474,11 +1532,12 @@ class TradingStateMachine:
                 is_win = pnl_pct > 0
                 self.risk.update_trade_result(is_win, pnl_pct)
 
-                if a["ratio"] < 0.999:
-                    # 부분 청산 반영
-                    p2 = self.portfolio.positions.get(market)
-                    if p2:
-                        p2.qty -= qty
+                remaining_qty = max(0.0, removed.qty - res.qty)
+                if remaining_qty > 1e-12:
+                    removed.qty = remaining_qty
+                    self.portfolio.positions[market] = removed
+                else:
+                    self.portfolio.remove(market)
 
     async def _snapshot_positions(self, last_prices):
         for m, p in self.portfolio.positions.items():
@@ -1574,7 +1633,9 @@ class TradingStateMachine:
         except Exception:
             pass
 
-        self.portfolio.remove(worst_market)
+        wp.qty = max(0.0, wp.qty - res.qty)
+        if wp.qty <= 1e-12:
+            self.portfolio.remove(worst_market)
         self.replacement_events.append(now_ms())
 
     async def _refresh_live_cache_step(self):
@@ -1590,7 +1651,8 @@ class TradingStateMachine:
             krw = [m for m in self.all_markets if m.startswith("KRW-")][:200]
             btc = [m for m in self.all_markets if m.startswith("BTC-")][:60]
             usdt = [m for m in self.all_markets if m.startswith("USDT-")][:60]
-            markets = krw + btc + usdt
+            markets = list(dict.fromkeys(krw + btc + usdt + list(self.portfolio.positions)))
+            markets = [m for m in markets if self._policy_allows(m, "SELL")]
             tickers = (
                 await self._call_with_retry(
                     lambda: self.rest.get_tickers(markets), name="get_tickers"
@@ -1621,7 +1683,9 @@ class TradingStateMachine:
             krw_ob = [m for m in self.all_markets if m.startswith("KRW-")][:20]
             btc_ob = [m for m in self.all_markets if m.startswith("BTC-")][:5]
             usdt_ob = [m for m in self.all_markets if m.startswith("USDT-")][:5]
-            ob_markets = krw_ob + btc_ob + usdt_ob
+            ob_markets = list(dict.fromkeys(list(self.portfolio.positions) + self.universe_top10 +
+                                           krw_ob + btc_ob + usdt_ob))
+            ob_markets = [m for m in ob_markets if self._policy_allows(m, "SELL")][:30]
             orderbooks = (
                 await self._call_with_retry(
                     lambda: self.rest.get_orderbook(ob_markets), name="get_orderbook"
@@ -1808,3 +1872,4 @@ class TradingStateMachine:
             }
             base = close
             await self.cache.push_candle(market, c)
+

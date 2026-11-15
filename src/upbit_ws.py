@@ -4,6 +4,7 @@ import logging
 import uuid
 from collections import deque
 from typing import Callable, Optional
+import time
 
 import websockets
 
@@ -99,13 +100,36 @@ class MarketCache:
         # {market: deque[candle_dict]}
         self.candles: dict[str, deque] = {}
 
+    @staticmethod
+    def _recent(row, max_age_seconds=90):
+        try:
+            age = time.time() - float(row["timestamp"]) / 1000
+            return 0 <= age <= max_age_seconds
+        except (KeyError, ValueError, TypeError):
+            return False
+
     async def seed_tickers(self, tickers: list[dict]):
         for t in tickers:
-            self.tickers[t["market"]] = t
+            if not isinstance(t, dict) or "market" not in t:
+                raise ValueError("invalid ticker")
+            self.tickers[t["market"]] = {**self.tickers.get(t["market"], {}), **t}
 
     async def seed_orderbooks(self, orderbooks: list[dict]):
         for ob in orderbooks:
+            if not isinstance(ob, dict) or "market" not in ob:
+                raise ValueError("invalid orderbook")
             self.orderbooks[ob["market"]] = ob
+
+    def prune(self, markets):
+        # This is quote-cache eviction, never deletion of positions or order history.
+        keep = set(markets)
+        self.tickers = {m: t for m, t in self.tickers.items() if m in keep}
+        self.orderbooks = {m: t for m, t in self.orderbooks.items() if m in keep}
+        self.candles = {m: t for m, t in self.candles.items() if m in keep}
+
+    async def fresh_snapshot(self, max_age_seconds=90):
+        return ({m: t for m, t in self.tickers.items() if self._recent(t, max_age_seconds)},
+                {m: t for m, t in self.orderbooks.items() if self._recent(t, max_age_seconds)})
 
     async def push_candle(self, market: str, candle: dict):
         if market not in self.candles:
@@ -148,3 +172,4 @@ class MarketCache:
             return 0.0
             
         return current_vol / avg_vol
+

@@ -4,6 +4,8 @@ import os
 from collections import defaultdict, deque
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from decimal import Decimal, ROUND_DOWN
+import math
 
 from .utils import now_ms, adjust_price_to_tick
 
@@ -28,6 +30,9 @@ class ExecutionEngine:
         self.storage = storage
         self.mode = mode
         self.rest = rest_client
+        self._execution_locks = defaultdict(asyncio.Lock)
+        if hasattr(rest_client, "configure_safety"):
+            rest_client.configure_safety(cfg, storage)
         self.slip_hist = defaultdict(lambda: deque(maxlen=30))
         self.cooldown_until_ms: dict[str, int] = {}
 
@@ -210,20 +215,62 @@ class ExecutionEngine:
         status = str(order.get("state") or "unknown")
         return fill_price, paid_fee, executed_volume, status
 
-    async def _poll_order(
-        self, order_uuid: str, retry: int = 6, wait_s: float = 0.5
-    ) -> dict | None:
-        if not self.rest:
-            return None
+    async def _poll_order(self, order_uuid: str, retry: int = 6, wait_s: float = 0.5):
         for _ in range(retry):
-            detail = await self.rest.get_order(order_uuid)
-            if not detail:
-                await asyncio.sleep(wait_s)
-                continue
-            if detail.get("state") in {"done", "cancel"}:
+            try:
+                detail = await self.rest.get_order(order_uuid)
+            except Exception:
+                return None
+            if isinstance(detail, dict) and detail.get("state") in {"done", "cancel"}:
                 return detail
             await asyncio.sleep(wait_s)
-        return await self.rest.get_order(order_uuid)
+        return None  # wait / malformed / unknown is NOT permission to resubmit
+
+    def _record_terminal_leg(self, market, side, detail, ref_price, reason):
+        if detail.get("state") not in {"done", "cancel"}:
+            raise ValueError("nonterminal order")
+        # Never infer a fill from a requested price or a missing executed quantity.
+        qty = float(detail["executed_volume"])
+        fee = float(detail["paid_fee"])
+        if not math.isfinite(qty) or qty < 0 or not math.isfinite(fee) or fee < 0:
+            raise ValueError("invalid fill quantity/fee")
+        price = ref_price
+        if qty > 0:
+            trades = detail.get("trades") or []
+            volume = sum(float(t["volume"]) for t in trades)
+            funds = sum(float(t.get("funds", float(t["price"]) * float(t["volume"]))) for t in trades)
+            if not trades or not math.isclose(volume, qty, rel_tol=1e-7, abs_tol=1e-12):
+                raise ValueError("incomplete trade details; reconciliation required")
+            price = funds / qty
+            if not math.isfinite(price) or price <= 0:
+                raise ValueError("invalid fill price")
+            slip = max(0.0, (price - ref_price) / ref_price if side == "BUY"
+                       else (ref_price - price) / ref_price)
+            status = "partial_cancel" if detail["state"] == "cancel" else "done"
+            self._save_trade(market, side, qty, qty * price, ref_price, price, fee, slip,
+                             reason, "filled_live_" + status)
+        # A crash before this point leaves the asset quarantined, including on restart.
+        if hasattr(self.storage, "acknowledge_order"):
+            self.storage.acknowledge_order(detail["uuid"])
+        return qty, price, fee
+
+    @staticmethod
+    def _minimum_quote(market):
+        return {"KRW": 5000.0, "BTC": 0.00005, "USDT": 0.5}[market.split("-")[0]]
+
+    @staticmethod
+    def _limit_price(market, price):
+        quote = market.split("-")[0]
+        if quote == "KRW":
+            return adjust_price_to_tick(price)
+        step = Decimal("0.00000001")
+        if quote == "USDT":
+            for bound, tick in [(10, ".01"), (1, ".001"), (.1, ".0001"),
+                                (.01, ".00001"), (.001, ".000001"), (.0001, ".0000001")]:
+                if price >= bound:
+                    step = Decimal(tick)
+                    break
+        return float((Decimal(str(price)) / step).to_integral_value(rounding=ROUND_DOWN) * step)
 
     async def _krw_available(self) -> float | None:
         return await self._quote_available("KRW")
@@ -239,7 +286,7 @@ class ExecutionEngine:
                 try:
                     bal = float(a.get("balance") or 0.0)
                     locked = float(a.get("locked") or 0.0)
-                    return max(0.0, bal - locked)
+                    return max(0.0, bal)
                 except Exception:
                     return None
         return None
@@ -260,7 +307,7 @@ class ExecutionEngine:
                 try:
                     bal = float(a.get("balance") or 0.0)
                     locked = float(a.get("locked") or 0.0)
-                    return max(0.0, bal - locked)
+                    return max(0.0, bal)
                 except Exception:
                     return None
         return None
@@ -323,8 +370,17 @@ class ExecutionEngine:
                 False, market, side, qty, ref_price, 0.0, 0.0, "kill_switch_on"
             )
 
+        if hasattr(self.rest, "order_block_reason"):
+            blocked = self.rest.order_block_reason(market, side)
+            if blocked:
+                return ExecutionResult(False, market, side, 0, ref_price, 0, 0, blocked)
+        if not all(math.isfinite(v) and v > 0 for v in (order_value_krw, qty, ref_price)):
+            return ExecutionResult(False, market, side, 0, ref_price, 0, 0, "invalid_order_amount")
+        quote_krw = order_value_krw / (qty * ref_price)
+
         if side == "BUY" and order_value_krw > self.max_order_krw:
             order_value_krw = self.max_order_krw
+            qty = order_value_krw / (quote_krw * ref_price)
 
         # 일일 거래 제한은 신규 진입(BUY)에만 적용. 청산(SELL)은 항상 허용.
         if side == "BUY" and (not self._within_daily_trade_limit()):
@@ -357,6 +413,7 @@ class ExecutionEngine:
                     max_value = max(0.0, avail * 0.98)
                     if order_value_krw > max_value:
                         order_value_krw = max_value
+                    qty = order_value_krw / ref_price
                     if order_value_krw < max(
                         float(self.cfg.get("min_notional_krw", 0)), 1000.0
                     ):
@@ -378,6 +435,7 @@ class ExecutionEngine:
                     if qty > max_qty:
                         qty = max(0.0, max_qty)
 
+                order_value_krw = qty * ref_price * quote_krw
                 min_notional = float(self.cfg.get("min_notional_krw", 5000))
                 if order_value_krw < min_notional:
                     return ExecutionResult(
@@ -397,6 +455,7 @@ class ExecutionEngine:
             if avail_qty is not None:
                 qty = min(qty, max(0.0, avail_qty))
 
+            order_value_krw = qty * ref_price * quote_krw
             if qty < 1e-12:
                 return ExecutionResult(
                     False,
@@ -497,6 +556,10 @@ class ExecutionEngine:
                             self.rest.place_market_buy, market, buy_amt
                         )
                         if buy_res and buy_res.get("uuid"):
+                            topup_detail = await self._poll_order(buy_res["uuid"])
+                            if topup_detail is None:
+                                return ExecutionResult(False, market, side, 0, ref_price, 0, 0, "dust_topup_unresolved")
+                            self._record_terminal_leg(market, "BUY", topup_detail, ref_price, "dust_topup")
                             await asyncio.sleep(1.0)
                             new_qty = await self._base_available(market)
                             if new_qty is not None and new_qty > qty:
@@ -558,154 +621,68 @@ class ExecutionEngine:
                         "live_under_min_notional",
                     )
 
-        fallback_fee = order_value_krw * self._fee_rate(market)
-        placed = None
-
-        # A. 매수는 취소 루프 없이 단일 시장가 주문으로 단순화(체결 실패/취소 churn 감소)
-        if side == "BUY":
-            if quote == "KRW":
-                placed = await self._call_rest(
-                    self.rest.place_market_buy, market, order_value_krw
-                )
-            else:
-                placed = await self._call_rest(
-                    self.rest.place_market_buy_volume, market, qty
-                )
-
-        # B. 매도 주문 (상황별 분기)
-        else:
-            # 1) 급한 상황: 손절(stop_loss) -> 즉시 시장가
-            if "stop" in reason.lower():
-                q = qty
-                # 시장가 매도 재시도 로직 (최대 3회)
-                for i in range(3):
-                    placed_try = await self._call_rest(
-                        self.rest.place_market_sell, market, q
-                    )
-                    # 성공하면 break
-                    if isinstance(placed_try, dict) and placed_try.get("uuid"):
-                        placed = placed_try
-                        break
-                    # 에러 처리 (잔고 부족 시 미세 조정)
-                    err = (placed_try or {}).get("error", {}).get("name", "")
-                    if "insufficient_funds" in str(placed_try):
-                        q = q * 0.995  # 0.5% 줄여서 재시도
-                        await asyncio.sleep(0.2)
-                        continue
-                    break
-
-            # 2) 여유 있는 상황: 지정가 짧게 대기 후 시장가 fallback
-            else:
-                limit_price = adjust_price_to_tick(ref_price)
-                placed = await self._call_rest(
-                    self.rest.place_limit_sell, market, qty, limit_price
-                )
-                if placed and placed.get("uuid"):
-                    wait_s = float(
-                        self.cfg.get("live", {}).get("sell_limit_wait_seconds", 2.0)
-                        or 2.0
-                    )
-                    await asyncio.sleep(max(0.5, wait_s))
-                    detail = await self._call_rest(self.rest.get_order, placed["uuid"])
-                    if detail and detail.get("state") == "wait":
-                        remaining_vol = float(detail.get("remaining_volume", 0.0))
-                        if remaining_vol * limit_price >= 1000.0:
-                            await self._call_rest(
-                                self.rest.cancel_order, placed["uuid"]
-                            )
-                            await asyncio.sleep(0.5)
-                            placed = await self._call_rest(
-                                self.rest.place_market_sell, market, remaining_vol
-                            )
-
-        if not placed or not placed.get("uuid"):
-            return ExecutionResult(
-                False, market, side, qty, ref_price, 0.0, 0.0, "live_place_failed"
-            )
-
-        detail = await self._poll_order(placed["uuid"])
-        if not detail:
-            return ExecutionResult(
-                False, market, side, qty, ref_price, 0.0, 0.0, "live_poll_failed"
-            )
-
-        fill_price, fee, filled_qty, status = self._parse_live_fill(
-            detail, ref_price, fallback_fee
-        )
-        fill_value = fill_price * max(filled_qty, 0.0)
-
-        # 부분 체결 시 잔량 처리 (시장가 주문이라 거의 다 체결되지만 혹시 모를 상황 대비)
-        if side == "BUY":
-            remaining_value = max(0.0, order_value_krw - fill_value)
-            remaining_qty = max(0.0, qty - filled_qty)
-        else:
-            remaining_qty = max(0.0, qty - filled_qty)
-            remaining_value = remaining_qty * ref_price
-
-        # 1회 재시도 정책
-        if remaining_qty > 1e-10 and remaining_value >= 1000:
+        legs = []
+        error = "live_not_filled"
+        try:
             if side == "BUY":
-                placed2 = await self._call_rest(
-                    self.rest.place_market_buy, market, remaining_value
-                )
+                if quote == "KRW":
+                    placed = await self._call_rest(self.rest.place_market_buy, market, order_value_krw)
+                else:
+                    placed = await self._call_rest(self.rest.place_market_buy_amount, market, qty * ref_price)
+            elif "stop" in reason.lower():
+                placed = await self._call_rest(self.rest.place_market_sell, market, qty)
             else:
-                placed2 = await self._call_rest(
-                    self.rest.place_market_sell, market, remaining_qty
-                )
-            if placed2 and placed2.get("uuid"):
-                detail2 = await self._poll_order(placed2["uuid"])
-                if detail2:
-                    fp2, fee2, fq2, _ = self._parse_live_fill(detail2, ref_price, 0.0)
-                    total_qty = filled_qty + fq2
-                    total_val = fill_value + (fp2 * fq2)
-                    if total_qty > 0:
-                        fill_price = total_val / total_qty
-                    fee += fee2
-                    filled_qty = total_qty
+                placed = await self._call_rest(self.rest.place_limit_sell, market, qty,
+                                              self._limit_price(market, ref_price))
 
+            if not isinstance(placed, dict) or not placed.get("uuid"):
+                error = ((placed or {}).get("error") or {}).get("name", "live_place_failed")
+            else:
+                may_fallback = False
+                if side == "SELL" and "stop" not in reason.lower():
+                    await asyncio.sleep(max(.5, float(self.cfg.get("live", {}).get("sell_limit_wait_seconds", 2))))
+                    detail = await self.rest.get_order(placed["uuid"])
+                    if detail.get("state") == "wait":
+                        cancellation = await self._call_rest(self.rest.cancel_order, placed["uuid"])
+                        # A rejected/malformed cancellation cannot authorize a second order.
+                        if not isinstance(cancellation, dict) or cancellation.get("uuid") != placed["uuid"] or cancellation.get("error"):
+                            raise RuntimeError("cancel_not_confirmed")
+                        detail = await self._poll_order(placed["uuid"])
+                        may_fallback = detail is not None and detail.get("state") == "cancel"
+                    elif detail.get("state") not in {"done", "cancel"}:
+                        detail = None
+                else:
+                    detail = await self._poll_order(placed["uuid"])
+                if detail is None:
+                    error = "order_unresolved"
+                else:
+                    legs.append(self._record_terminal_leg(market, side, detail, ref_price, reason))
+                    # Reconcile the original terminal order first; only its remainder can follow.
+                    remaining = max(0.0, qty - legs[0][0])
+                    if may_fallback and remaining * ref_price >= self._minimum_quote(market):
+                        placed2 = await self._call_rest(self.rest.place_market_sell, market, remaining)
+                        if isinstance(placed2, dict) and placed2.get("uuid"):
+                            detail2 = await self._poll_order(placed2["uuid"])
+                            if detail2 is not None:
+                                legs.append(self._record_terminal_leg(market, side, detail2, ref_price, reason))
+                            else:
+                                error = "order_unresolved"
+                        else:
+                            error = ((placed2 or {}).get("error") or {}).get("name", "live_place_failed")
+        except Exception as exc:
+            error = "order_unresolved:" + type(exc).__name__
+            self._log_runtime_event("ERROR", "ORDER_RECONCILIATION_REQUIRED", market, error)
+
+        filled_qty = sum(leg[0] for leg in legs)
         if filled_qty <= 1e-12:
-            self.cooldown_until_ms[market] = (
-                now_ms() + self.cfg["gates"]["cooldown_minutes"] * 60 * 1000
-            )
-            return ExecutionResult(
-                False, market, side, qty, ref_price, 0.0, 0.0, "live_not_filled"
-            )
-
-        if side == "BUY":
-            slip = max(0.0, (fill_price - ref_price) / max(ref_price, 1e-9))
-        else:
-            slip = max(0.0, (ref_price - fill_price) / max(ref_price, 1e-9))
-
+            return ExecutionResult(False, market, side, 0, ref_price, 0, 0, error)
+        fill_price = sum(q * p for q, p, _ in legs) / filled_qty
+        fee = sum(leg[2] for leg in legs)
+        slip = max(0.0, (fill_price - ref_price) / ref_price if side == "BUY"
+                   else (ref_price - fill_price) / ref_price)
         self.slip_hist[market].append(slip)
         self._maybe_cooldown_by_slippage(market, side, slip)
-
-        # Normalize status: canceled orders can be partially filled.
-        if status == "cancel" and filled_qty > 1e-12:
-            status = "partial_cancel"
-
-        filled_value_effective = filled_qty * fill_price
-        self._save_trade(
-            market,
-            side,
-            filled_qty,
-            filled_value_effective,
-            ref_price,
-            fill_price,
-            fee,
-            slip,
-            reason,
-            f"filled_live_{status}",
-        )
-
-        # 1회 재시도 후에도 부족 체결이면 비정상으로 판단
-        if filled_qty < qty * 0.98:
-            self.cooldown_until_ms[market] = (
-                now_ms() + self.cfg["gates"]["cooldown_minutes"] * 60 * 1000
-            )
-
-        return ExecutionResult(
-            True, market, side, filled_qty, fill_price, fee, slip, reason
-        )
+        return ExecutionResult(True, market, side, filled_qty, fill_price, fee, slip, reason)
 
     async def execute_market(
         self,
@@ -717,11 +694,12 @@ class ExecutionEngine:
         slip_est: float,
         reason: str,
     ) -> ExecutionResult:
-        if self.mode == "live" and self.rest and self.rest.is_live_ready:
+        if self.mode == "live":
             try:
-                return await self._execute_live(
-                    market, side, order_value_krw, qty, ref_price, reason
-                )
+                async with self._execution_locks[market.split("-", 1)[-1]]:
+                    return await self._execute_live(
+                        market, side, order_value_krw, qty, ref_price, reason
+                    )
             except Exception as e:
                 LOGGER.exception("execute_market live failed: %s", e)
                 return ExecutionResult(
@@ -781,96 +759,8 @@ class ExecutionEngine:
         reason: str,
         orderbook: dict | None = None,
     ) -> ExecutionResult:
-        cfg_exec = self.cfg.get("execution", {})
-        use_maker_first = cfg_exec.get("use_maker_first", True)
-        max_spread_for_limit = cfg_exec.get("max_spread_for_limit", 0.0015)
-        limit_timeout = cfg_exec.get("limit_order_timeout_seconds", 3.0)
-
-        if not use_maker_first or side != "BUY" or not orderbook:
-            return await self.execute_market(
-                market, side, order_value_krw, qty, ref_price, slip_est, reason
-            )
-
-        spread_pct = self._spread_pct(orderbook)
-        if spread_pct > max_spread_for_limit:
-            return await self.execute_market(
-                market, side, order_value_krw, qty, ref_price, slip_est, reason
-            )
-
-        units = orderbook.get("orderbook_units", [])
-        if not units:
-            return await self.execute_market(
-                market, side, order_value_krw, qty, ref_price, slip_est, reason
-            )
-
-        ask_price = float(units[0].get("ask_price", 0.0))
-        ask_size = float(units[0].get("ask_size", 0.0))
-        if ask_price <= 0 or ask_size <= 0:
-            return await self.execute_market(
-                market, side, order_value_krw, qty, ref_price, slip_est, reason
-            )
-
-        available_ask_value = ask_price * ask_size
-        if available_ask_value < order_value_krw * 0.5:
-            return await self.execute_market(
-                market, side, order_value_krw, qty, ref_price, slip_est, reason
-            )
-
-        limit_price = adjust_price_to_tick(ask_price * 0.999)
-        qty_to_buy = min(qty, ask_size * 1.02)
-        quote = market.split("-")[0] if "-" in market else "KRW"
-
-        try:
-            if quote == "KRW":
-                placed = await self._call_rest(
-                    self.rest.place_limit_buy, market, order_value_krw, limit_price
-                )
-            else:
-                placed = await self._call_rest(
-                    self.rest.place_limit_buy_volume, market, qty_to_buy, limit_price
-                )
-
-            if placed and placed.get("uuid"):
-                wait_time = max(0.5, limit_timeout)
-                await asyncio.sleep(wait_time)
-                detail = await self._call_rest(self.rest.get_order, placed["uuid"])
-
-                if detail and detail.get("state") == "done":
-                    fill_price = float(detail.get("price", limit_price))
-                    fee = order_value_krw * self._fee_rate(market)
-                    slip = max(0.0, (fill_price - ref_price) / max(ref_price, 1e-9))
-                    self.slip_hist[market].append(slip)
-                    self._save_trade(
-                        market,
-                        side,
-                        qty_to_buy,
-                        order_value_krw,
-                        ref_price,
-                        fill_price,
-                        fee,
-                        slip,
-                        reason + "_maker",
-                        "filled_maker",
-                    )
-                    return ExecutionResult(
-                        True,
-                        market,
-                        side,
-                        qty_to_buy,
-                        fill_price,
-                        fee,
-                        slip,
-                        reason + "_maker",
-                    )
-
-                if detail and detail.get("state") == "wait":
-                    remaining = float(detail.get("remaining_volume", 0.0))
-                    await self._call_rest(self.rest.cancel_order, placed["uuid"])
-                    await asyncio.sleep(0.3)
-
-        except Exception as e:
-            LOGGER.debug("Maker order failed, falling back to market: %s", e)
-
+        # Main strategy already uses execute_market. Keep this legacy entry point
+        # on the same guarded path; never let it bypass live/paper/kill-switch checks.
         return await self.execute_market(
             market, side, order_value_krw, qty, ref_price, slip_est, reason
         )
@@ -879,17 +769,8 @@ class ExecutionEngine:
         return now_ms() < self.cooldown_until_ms.get(market, 0)
 
     async def _call_rest(self, fn, *args, retries: int = 3, base_delay_s: float = 0.5):
-        for attempt in range(retries):
-            try:
-                return await fn(*args)
-            except Exception as e:
-                if attempt == retries - 1:
-                    raise
-                wait = base_delay_s * (2**attempt)
-                LOGGER.warning(
-                    "REST call failed (%s), retrying in %.2fs: %s", fn.__name__, wait, e
-                )
-                await asyncio.sleep(wait)
+        # Transport owns GET retries. Never retry a mutation at a second layer.
+        return await fn(*args)
 
     def _within_daily_trade_limit(self) -> bool:
         """일일 거래횟수 제한 체크.
@@ -922,3 +803,4 @@ class ExecutionEngine:
         except Exception:
             # 실패 시 보수적으로 허용 (실거래 차단으로 인한 장애 전파 방지)
             return True
+
